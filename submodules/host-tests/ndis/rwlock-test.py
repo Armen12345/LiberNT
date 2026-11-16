@@ -47,7 +47,12 @@ static int Failures;
 static KIRQL CurrentIrql;
 static PVOID CurrentThread;
 static ULONG CurrentProcessor;
-static signed char KeNumberProcessors = 4;
+static unsigned int *PendingReader;
+#define RTL_NUMBER_OF(a) (sizeof(a) / sizeof((a)[0]))
+#define ReadULongPtrAcquire(p) (*(p))
+static ULONG ReadULongAcquire(volatile ULONG *p) { return *p; }
+static void YieldProcessor(void) { ASSERT(PendingReader != NULL); *PendingReader = 0; PendingReader = NULL; }
+static LONG InterlockedDecrement(PLONG Value) { return --*Value; }
 
 static PVOID PsGetCurrentThread(void) { return CurrentThread; }
 static ULONG NdisICurrentProcessorIndex(void) { return CurrentProcessor; }
@@ -105,6 +110,15 @@ int main(void)
     CHECK(Lock.SpinLock == 1 && Lock.Context == &ThreadB);
     NdisReleaseReadWriteLock(&Lock, &Write);
     CHECK(Lock.SpinLock == 0 && Lock.Context == NULL);
+
+    for (ULONG cpu = 0; cpu <= MAXIMUM_PROCESSORS; cpu += MAXIMUM_PROCESSORS) {
+        Become(&ThreadA, cpu);
+        Lock.RefCount[7].RefCount = 1;
+        PendingReader = &Lock.RefCount[7].RefCount;
+        NdisAcquireReadWriteLock(&Lock, cpu == 0, &Write);
+        CHECK(PendingReader == NULL && Lock.SpinLock == 1);
+        NdisReleaseReadWriteLock(&Lock, &Write);
+    }
 
     if (!Failures)
         printf("ndis rwlock: a writer is exclusive whatever it read before, and may nest inside itself\n");
