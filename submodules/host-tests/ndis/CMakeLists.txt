@@ -12,3 +12,11 @@ add_executable(ndis_poll t_poll.c)
 target_include_directories(ndis_poll PRIVATE ${REACTOS_HOST_SOURCE_ROOT}/drivers/network/ndis/include)
 target_compile_options(ndis_poll PRIVATE -Wall -Wextra)
 add_test(NAME ndis.poll COMMAND ndis_poll)
+
+if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Linux")
+    find_package(Python3 QUIET COMPONENTS Interpreter)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME ndis.addressing_reset COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/addressing-reset-test.py
+            --root ${REACTOS_HOST_SOURCE_ROOT} --cc ${CMAKE_C_COMPILER})
+    endif()
+endif()
