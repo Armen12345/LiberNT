@@ -144,46 +144,49 @@ DwMmcSetBusWidth(_In_ PFDO_EXTENSION FdoExtension, _In_ UCHAR BusWidth)
 }
 
 static VOID
-DwMmcAllocateIdmac(_Inout_ PFDO_EXTENSION FdoExtension)
+DwMmcAllocateIdmac(_Inout_ PFDO_EXTENSION FdoExtension, _In_ ULONG Hcon)
 {
     PHYSICAL_ADDRESS Lowest, Highest, Boundary;
-    ULONG Hcon = DwMmcRead(FdoExtension, DWMMC_HCON);
+    PVOID Descriptors;
+    PHYSICAL_ADDRESS DescriptorsPhysical;
 
-    FdoExtension->DwMmcDescriptors = NULL;
-    FdoExtension->DwMmcDescriptorsPhysical = 0;
+    ASSERT(FdoExtension->DmaBuffer == NULL && FdoExtension->DmaBufferSize == 0);
+    ASSERT(FdoExtension->DwMmcDescriptors == NULL && FdoExtension->DwMmcDescriptorsPhysical == 0);
     if (DWMMC_HCON_DMA_INTERFACE(Hcon) != DWMMC_HCON_DMA_INTERNAL)
         return;
     /* TODO: 64-bit IDMAC descriptors; such a host stays on polled PIO */
     if (Hcon & DWMMC_HCON_ADDRESS_64BIT)
         return;
 
+    Lowest.QuadPart = 0;
+    Highest.QuadPart = 0xFFFFFFFF;
+    Boundary.QuadPart = 0;
+    Descriptors = MmAllocateContiguousMemorySpecifyCache(DWMMC_IDMAC_TABLE_BYTES, Lowest, Highest, Boundary,
+                                                         MmNonCached);
+    if (Descriptors == NULL)
+        return;
+    FdoExtension->DmaBuffer = MmAllocateContiguousMemorySpecifyCache(DWMMC_IDMAC_BUFFER_BYTES, Lowest, Highest,
+                                                                     Boundary, MmNonCached);
     if (FdoExtension->DmaBuffer == NULL)
     {
-        Lowest.QuadPart = 0;
-        Highest.QuadPart = 0xFFFFFFFF;
-        Boundary.QuadPart = 0;
-        FdoExtension->DmaBuffer = MmAllocateContiguousMemorySpecifyCache(DWMMC_IDMAC_BUFFER_BYTES + PAGE_SIZE,
-                                                                         Lowest, Highest, Boundary, MmNonCached);
-        if (FdoExtension->DmaBuffer == NULL)
-        {
-            FdoExtension->DmaBufferSize = 0;
-            return;
-        }
-        FdoExtension->DmaPhysical = MmGetPhysicalAddress(FdoExtension->DmaBuffer);
-        FdoExtension->DmaBufferSize = DWMMC_IDMAC_BUFFER_BYTES;
+        MmFreeContiguousMemorySpecifyCache(Descriptors, DWMMC_IDMAC_TABLE_BYTES, MmNonCached);
+        return;
     }
 
-    ASSERT(FdoExtension->DmaBufferSize == DWMMC_IDMAC_BUFFER_BYTES);
-    ASSERT(FdoExtension->DmaPhysical.QuadPart + DWMMC_IDMAC_BUFFER_BYTES + PAGE_SIZE <= 0x100000000LL);
-    FdoExtension->DwMmcDescriptors =
-        (PDWMMC_IDMAC_DESCRIPTOR)((PUCHAR)FdoExtension->DmaBuffer + DWMMC_IDMAC_BUFFER_BYTES);
-    FdoExtension->DwMmcDescriptorsPhysical = FdoExtension->DmaPhysical.LowPart + DWMMC_IDMAC_BUFFER_BYTES;
+    FdoExtension->DmaPhysical = MmGetPhysicalAddress(FdoExtension->DmaBuffer);
+    FdoExtension->DmaBufferSize = DWMMC_IDMAC_BUFFER_BYTES;
+    DescriptorsPhysical = MmGetPhysicalAddress(Descriptors);
+    ASSERT(FdoExtension->DmaPhysical.QuadPart + DWMMC_IDMAC_BUFFER_BYTES <= 0x100000000LL);
+    ASSERT(DescriptorsPhysical.QuadPart + DWMMC_IDMAC_TABLE_BYTES <= 0x100000000LL);
+    FdoExtension->DwMmcDescriptors = (PDWMMC_IDMAC_DESCRIPTOR)Descriptors;
+    FdoExtension->DwMmcDescriptorsPhysical = DescriptorsPhysical.LowPart;
 }
 
 NTSTATUS
 DwMmcInitializeController(_In_ PFDO_EXTENSION FdoExtension)
 {
     ULONG Version;
+    ULONG Hcon;
 
     if (FdoExtension->DwMmcBusHz == 0)
         return STATUS_DEVICE_CONFIGURATION_ERROR;
@@ -199,8 +202,6 @@ DwMmcInitializeController(_In_ PFDO_EXTENSION FdoExtension)
     FdoExtension->UseSdma = FALSE;
     FdoExtension->CurrentBusWidth = 1;
     FdoExtension->DwMmcHighSpeed = FALSE;
-    FdoExtension->DwMmcDescriptors = NULL;
-    FdoExtension->DwMmcDescriptorsPhysical = 0;
     InterlockedExchange(&FdoExtension->CurrentClockKhz, 0);
     InterlockedExchange(&FdoExtension->CommandInterruptStatus, 0);
 
@@ -215,10 +216,22 @@ DwMmcInitializeController(_In_ PFDO_EXTENSION FdoExtension)
     DwMmcWrite(FdoExtension, DWMMC_CTRL, DwMmcRead(FdoExtension, DWMMC_CTRL) & ~DWMMC_CTRL_INT_ENABLE);
     DwMmcWrite(FdoExtension, DWMMC_TMOUT, DWMMC_TMOUT_MAX);
 
-    DwMmcAllocateIdmac(FdoExtension);
-    DwMmcWrite(FdoExtension, DWMMC_BMOD, DWMMC_BMOD_SWRESET);
-    DwMmcWrite(FdoExtension, DWMMC_IDINTEN, 0);
-    DwMmcWrite(FdoExtension, DWMMC_IDSTS, DWMMC_IDSTS_ALL);
+    DwMmcWrite(FdoExtension, DWMMC_CTRL,
+               DwMmcRead(FdoExtension, DWMMC_CTRL) & ~(DWMMC_CTRL_DMA_ENABLE | DWMMC_CTRL_USE_IDMAC));
+    Hcon = DwMmcRead(FdoExtension, DWMMC_HCON);
+    if (DWMMC_HCON_DMA_INTERFACE(Hcon) == DWMMC_HCON_DMA_INTERNAL)
+    {
+        DwMmcWrite(FdoExtension, DWMMC_BMOD, DWMMC_BMOD_SWRESET);
+        if (!DwMmcPollClear(FdoExtension, DWMMC_BMOD, DWMMC_BMOD_SWRESET, SD_CMD_TIMEOUT_MS))
+            return STATUS_IO_TIMEOUT;
+        /* IDSTS and IDINTEN sit at other offsets when the internal DMA uses 64-bit addresses */
+        if (!(Hcon & DWMMC_HCON_ADDRESS_64BIT))
+        {
+            DwMmcWrite(FdoExtension, DWMMC_IDINTEN, 0);
+            DwMmcWrite(FdoExtension, DWMMC_IDSTS, DWMMC_IDSTS_ALL);
+        }
+    }
+    DwMmcAllocateIdmac(FdoExtension, Hcon);
     /* FIXME: no high-speed while reads are polled: a full FIFO stops the card clock, which corrupts high-speed blocks */
     if (FdoExtension->DwMmcDescriptors != NULL)
         FdoExtension->HostCapabilities |= SDHCI_CAP_HIGH_SPEED;

@@ -205,9 +205,16 @@ SdBusReleaseControllerResources(
     FdoExtension->UseAdma2 = FALSE;
     FdoExtension->Adma2MaxDescriptors = 0;
 
+    if (FdoExtension->DwMmcDescriptors != NULL)
+    {
+        MmFreeContiguousMemorySpecifyCache(FdoExtension->DwMmcDescriptors, DWMMC_IDMAC_TABLE_BYTES, MmNonCached);
+        FdoExtension->DwMmcDescriptors = NULL;
+        FdoExtension->DwMmcDescriptorsPhysical = 0;
+    }
+
     if (FdoExtension->DmaBuffer != NULL)
     {
-        MmFreeContiguousMemory(FdoExtension->DmaBuffer);
+        MmFreeContiguousMemorySpecifyCache(FdoExtension->DmaBuffer, FdoExtension->DmaBufferSize, MmNonCached);
         FdoExtension->DmaBuffer = NULL;
     }
     FdoExtension->UseSdma = FALSE;
