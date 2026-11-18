@@ -201,7 +201,7 @@ DwMmcInitializeController(_In_ PFDO_EXTENSION FdoExtension)
     FdoExtension->UseAdma2 = FALSE;
     FdoExtension->UseSdma = FALSE;
     FdoExtension->CurrentBusWidth = 1;
-    FdoExtension->DwMmcHighSpeed = FALSE;
+    FdoExtension->HostHighSpeed = FALSE;
     InterlockedExchange(&FdoExtension->CurrentClockKhz, 0);
     InterlockedExchange(&FdoExtension->CommandInterruptStatus, 0);
 
