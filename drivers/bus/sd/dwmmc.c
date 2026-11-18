@@ -441,7 +441,7 @@ DwMmcTransferPio(_In_ PFDO_EXTENSION FdoExtension, _In_ BOOLEAN IsRead, _Inout_ 
     return STATUS_SUCCESS;
 }
 
-static VOID
+static NTSTATUS
 DwMmcIdmacStart(_In_ PFDO_EXTENSION FdoExtension, _In_ ULONG TotalBytes)
 {
     PDWMMC_IDMAC_DESCRIPTOR Descriptor = FdoExtension->DwMmcDescriptors;
@@ -454,44 +454,60 @@ DwMmcIdmacStart(_In_ PFDO_EXTENSION FdoExtension, _In_ ULONG TotalBytes)
     ASSERT(Count <= DWMMC_IDMAC_DESCRIPTOR_COUNT);
     ASSERT(!(DwMmcRead(FdoExtension, DWMMC_CTRL) & (DWMMC_CTRL_DMA_ENABLE | DWMMC_CTRL_USE_IDMAC)));
 
+    DwMmcWrite(FdoExtension, DWMMC_CTRL, DwMmcRead(FdoExtension, DWMMC_CTRL) | DWMMC_CTRL_DMA_RESET);
+    if (!DwMmcPollClear(FdoExtension, DWMMC_CTRL, DWMMC_CTRL_DMA_RESET, SD_CMD_TIMEOUT_MS))
+        return STATUS_IO_TIMEOUT;
+    DwMmcWrite(FdoExtension, DWMMC_BMOD, DWMMC_BMOD_SWRESET);
+    if (!DwMmcPollClear(FdoExtension, DWMMC_BMOD, DWMMC_BMOD_SWRESET, SD_CMD_TIMEOUT_MS))
+        return STATUS_IO_TIMEOUT;
+
     for (Index = 0; Index < Count; Index++)
     {
         ULONG Chunk = min(TotalBytes - Offset, DWMMC_IDMAC_CHUNK_BYTES);
-        ULONG Control = DWMMC_DES0_OWN | DWMMC_DES0_CHAINED;
+        ULONG Control = DWMMC_DES0_OWN;
 
         if (Index == 0)
             Control |= DWMMC_DES0_FIRST;
         if (Index == Count - 1)
             Control |= DWMMC_DES0_LAST;
+        else
+            Control |= DWMMC_DES0_CHAINED | DWMMC_DES0_DIC;
         Descriptor[Index].Size = Chunk;
         Descriptor[Index].Buffer = FdoExtension->DmaPhysical.LowPart + Offset;
-        Descriptor[Index].Next = FdoExtension->DwMmcDescriptorsPhysical +
-                                 ((Index + 1) % DWMMC_IDMAC_DESCRIPTOR_COUNT) * sizeof(DWMMC_IDMAC_DESCRIPTOR);
+        Descriptor[Index].Next = (Index == Count - 1) ? 0 : FdoExtension->DwMmcDescriptorsPhysical +
+                                                            (Index + 1) * sizeof(DWMMC_IDMAC_DESCRIPTOR);
         Descriptor[Index].Control = Control;
         Offset += Chunk;
     }
     ASSERT(Offset == TotalBytes);
     KeMemoryBarrier();
 
-    DwMmcWrite(FdoExtension, DWMMC_IDINTEN, DWMMC_IDSTS_TI | DWMMC_IDSTS_RI | DWMMC_IDSTS_FBE);
     DwMmcWrite(FdoExtension, DWMMC_IDSTS, DWMMC_IDSTS_ALL);
     DwMmcWrite(FdoExtension, DWMMC_DBADDR, FdoExtension->DwMmcDescriptorsPhysical);
     DwMmcWrite(FdoExtension, DWMMC_CTRL,
                DwMmcRead(FdoExtension, DWMMC_CTRL) | DWMMC_CTRL_DMA_ENABLE | DWMMC_CTRL_USE_IDMAC);
     DwMmcWrite(FdoExtension, DWMMC_BMOD,
                DwMmcRead(FdoExtension, DWMMC_BMOD) | DWMMC_BMOD_FIXED_BURST | DWMMC_BMOD_ENABLE);
+    return STATUS_SUCCESS;
 }
 
 static VOID
-DwMmcIdmacStop(_In_ PFDO_EXTENSION FdoExtension, _In_ BOOLEAN Failed)
+DwMmcIdmacStop(_In_ PFDO_EXTENSION FdoExtension)
 {
     DwMmcWrite(FdoExtension, DWMMC_CTRL,
                DwMmcRead(FdoExtension, DWMMC_CTRL) & ~(DWMMC_CTRL_DMA_ENABLE | DWMMC_CTRL_USE_IDMAC));
     DwMmcWrite(FdoExtension, DWMMC_BMOD,
                DwMmcRead(FdoExtension, DWMMC_BMOD) & ~(DWMMC_BMOD_FIXED_BURST | DWMMC_BMOD_ENABLE));
-    if (Failed)
-        DwMmcWrite(FdoExtension, DWMMC_BMOD, DWMMC_BMOD_SWRESET);
     DwMmcWrite(FdoExtension, DWMMC_IDSTS, DWMMC_IDSTS_ALL);
+}
+
+static NTSTATUS
+DwMmcIdmacFailed(_In_ PFDO_EXTENSION FdoExtension, _In_ ULONG IdmacStatus)
+{
+    DPRINT1("[DWMMC] internal DMA %s (IDSTS=0x%08lx DSCADDR=0x%08lx BUFADDR=0x%08lx)\n",
+            (IdmacStatus & DWMMC_IDSTS_FBE) ? "bus error" : "found a descriptor it does not own", IdmacStatus,
+            DwMmcRead(FdoExtension, DWMMC_DSCADDR), DwMmcRead(FdoExtension, DWMMC_BUFADDR));
+    return STATUS_SD_IO_ERROR;
 }
 
 static NTSTATUS
@@ -504,11 +520,8 @@ DwMmcIdmacWait(_In_ PFDO_EXTENSION FdoExtension, _In_ BOOLEAN IsRead)
     for (;;)
     {
         Status = DwMmcRead(FdoExtension, DWMMC_IDSTS);
-        if (Status & DWMMC_IDSTS_FBE)
-        {
-            DPRINT1("[DWMMC] internal DMA bus error (IDSTS=0x%08lx)\n", Status);
-            return STATUS_SD_IO_ERROR;
-        }
+        if (Status & DWMMC_IDSTS_ERRORS)
+            return DwMmcIdmacFailed(FdoExtension, Status);
         if (Status & Wanted)
             return STATUS_SUCCESS;
         if (Budget == 0)
@@ -527,17 +540,24 @@ DwMmcIdmacWait(_In_ PFDO_EXTENSION FdoExtension, _In_ BOOLEAN IsRead)
 }
 
 static NTSTATUS
-DwMmcWaitDataDone(_In_ PFDO_EXTENSION FdoExtension, _In_ BOOLEAN AutoStop)
+DwMmcWaitDataDone(_In_ PFDO_EXTENSION FdoExtension, _In_ BOOLEAN AutoStop, _In_ BOOLEAN UseIdmac)
 {
     ULONG Wanted = DWMMC_INT_DATA_OVER | (AutoStop ? DWMMC_INT_ACD : 0);
     ULONG Budget = SD_DATA_TIMEOUT_MS * 100;
     ULONG Interrupts;
+    ULONG IdmacStatus;
 
     for (;;)
     {
         Interrupts = DwMmcRead(FdoExtension, DWMMC_RINTSTS);
         if (Interrupts & DWMMC_INT_DATA_ERRORS)
             return DwMmcErrorToStatus(Interrupts & DWMMC_INT_DATA_ERRORS);
+        if (UseIdmac)
+        {
+            IdmacStatus = DwMmcRead(FdoExtension, DWMMC_IDSTS);
+            if (IdmacStatus & DWMMC_IDSTS_ERRORS)
+                return DwMmcIdmacFailed(FdoExtension, IdmacStatus);
+        }
         if ((Interrupts & Wanted) == Wanted)
             return STATUS_SUCCESS;
         if (Budget == 0)
@@ -585,7 +605,13 @@ DwMmcExecuteDataCommand(
     {
         if (!IsRead)
             RtlCopyMemory(FdoExtension->DmaBuffer, Buffer, TotalBytes);
-        DwMmcIdmacStart(FdoExtension, TotalBytes);
+        Status = DwMmcIdmacStart(FdoExtension, TotalBytes);
+        if (!NT_SUCCESS(Status))
+        {
+            DwMmcIdmacStop(FdoExtension);
+            (VOID)DwMmcReset(FdoExtension);
+            return Status;
+        }
     }
 
     DataFlags = DWMMC_CMD_DAT_EXP | (IsRead ? 0 : DWMMC_CMD_DAT_WR) | (SendStopCommand ? DWMMC_CMD_SEND_STOP : 0);
@@ -595,17 +621,17 @@ DwMmcExecuteDataCommand(
     if (!NT_SUCCESS(Status))
     {
         if (UseIdmac)
-            DwMmcIdmacStop(FdoExtension, TRUE);
+            DwMmcIdmacStop(FdoExtension);
         (VOID)DwMmcReset(FdoExtension);
         return Status;
     }
 
     if (UseIdmac)
     {
-        Status = DwMmcWaitDataDone(FdoExtension, SendStopCommand);
+        Status = DwMmcWaitDataDone(FdoExtension, SendStopCommand, TRUE);
         if (NT_SUCCESS(Status))
             Status = DwMmcIdmacWait(FdoExtension, IsRead);
-        DwMmcIdmacStop(FdoExtension, (BOOLEAN)!NT_SUCCESS(Status));
+        DwMmcIdmacStop(FdoExtension);
         if (NT_SUCCESS(Status) && IsRead)
             RtlCopyMemory(Buffer, FdoExtension->DmaBuffer, TotalBytes);
     }
@@ -613,7 +639,7 @@ DwMmcExecuteDataCommand(
     {
         Status = DwMmcTransferPio(FdoExtension, IsRead, (PUCHAR)Buffer, TotalBytes);
         if (NT_SUCCESS(Status))
-            Status = DwMmcWaitDataDone(FdoExtension, SendStopCommand);
+            Status = DwMmcWaitDataDone(FdoExtension, SendStopCommand, FALSE);
     }
     if (NT_SUCCESS(Status) && !IsRead)
         Status = DwMmcWaitNotBusy(FdoExtension, SD_DATA_TIMEOUT_MS);

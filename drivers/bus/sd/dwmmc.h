@@ -103,8 +103,11 @@
 #define DWMMC_IDSTS_TI                  (1UL << 0)
 #define DWMMC_IDSTS_RI                  (1UL << 1)
 #define DWMMC_IDSTS_FBE                 (1UL << 2)
+#define DWMMC_IDSTS_DU                  (1UL << 4)
 #define DWMMC_IDSTS_ALL                 0xFFFFFFFFUL
+#define DWMMC_IDSTS_ERRORS              (DWMMC_IDSTS_FBE | DWMMC_IDSTS_DU)
 
+#define DWMMC_DES0_DIC                  (1UL << 1)
 #define DWMMC_DES0_LAST                 (1UL << 2)
 #define DWMMC_DES0_FIRST                (1UL << 3)
 #define DWMMC_DES0_CHAINED              (1UL << 4)
