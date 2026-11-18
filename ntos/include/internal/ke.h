@@ -37,8 +37,9 @@
 #define KiArchPublishSystemCallStubs(DllBase) ((VOID)(DllBase), STATUS_SUCCESS)
 #endif
 
-#ifndef KiArchUserSListPopRollsBack
-#define KiArchUserSListPopRollsBack() TRUE
+#ifndef KiArchSystemDllSListMarkersPresent
+#define KiArchSystemDllSListMarkersPresent(End, Fault, Resume) \
+    ((End) != NULL && (Fault) != NULL && (Resume) != NULL)
 #endif
 
 #ifndef KiArchExceptionContextFlags
@@ -521,6 +522,9 @@ KiDisplayBugCheckRegisterState(
     _In_opt_ PKTRAP_FRAME TrapFrame,
     _In_ PCONTEXT Context);
 #endif
+
+ULONG64
+KiReadCycleCounter(VOID);
 
 #if (NTDDI_VERSION >= NTDDI_LONGHORN)
 VOID

@@ -122,6 +122,7 @@ list(APPEND SOURCE
     SetProp.c
     SetScrollInfo.c
     SetScrollRange.c
+    StructPadding.c
     SetWindowPlacement.c
     SharedInputLanguage.c
     ShellHookShowActive.c
@@ -145,6 +146,7 @@ list(APPEND SOURCE
     WaitForInputIdle.c
     WindowBand.c
     WindowStationErrors.c
+    WindowStationAttributes.c
     WindowStationSecurity.c
     WindowPosInsertAfter.c
     WndProc.c
