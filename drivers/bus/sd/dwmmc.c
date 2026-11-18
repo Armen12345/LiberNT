@@ -441,6 +441,31 @@ DwMmcTransferPio(_In_ PFDO_EXTENSION FdoExtension, _In_ BOOLEAN IsRead, _Inout_ 
     return STATUS_SUCCESS;
 }
 
+static BOOLEAN
+DwMmcUseIdmac(_In_ PFDO_EXTENSION FdoExtension, _In_ ULONG TotalBytes)
+{
+    return FdoExtension->DwMmcDescriptors != NULL && TotalBytes >= DWMMC_IDMAC_MIN_BYTES &&
+           TotalBytes <= FdoExtension->DmaBufferSize;
+}
+
+static ULONG
+DwMmcFifoThreshold(_In_ ULONG FifoDepth, _In_ ULONG BlockSize)
+{
+    ULONG TxWatermark = FifoDepth / 2;
+    ULONG BlockWords = BlockSize / sizeof(ULONG);
+    ULONG Size;
+
+    ASSERT(FifoDepth >= 2 && (BlockSize % sizeof(ULONG)) == 0);
+    for (Size = DWMMC_FIFOTH_MSIZE_MAX; Size > 0; Size--)
+    {
+        ULONG Burst = 2UL << Size;
+
+        if ((BlockWords % Burst) == 0 && ((FifoDepth - TxWatermark) % Burst) == 0)
+            return (Size << DWMMC_FIFOTH_MSIZE_SHIFT) | ((Burst - 1) << DWMMC_FIFOTH_RX_SHIFT) | TxWatermark;
+    }
+    return (1UL << DWMMC_FIFOTH_RX_SHIFT) | TxWatermark;
+}
+
 static NTSTATUS
 DwMmcIdmacStart(_In_ PFDO_EXTENSION FdoExtension, _In_ ULONG TotalBytes)
 {
@@ -586,13 +611,13 @@ DwMmcExecuteDataCommand(
     ULONG LocalResponse[4];
     ULONG DataFlags;
     ULONG TotalBytes = BlockSize * BlockCount;
-    BOOLEAN UseIdmac = (FdoExtension->DwMmcDescriptors != NULL);
+    BOOLEAN UseIdmac;
     NTSTATUS Status;
 
     if (Buffer == NULL || BlockSize == 0 || BlockCount == 0 || (BlockSize % sizeof(ULONG)) != 0)
         return STATUS_INVALID_PARAMETER;
-    if (UseIdmac && TotalBytes > FdoExtension->DmaBufferSize)
-        return STATUS_INVALID_BUFFER_SIZE;
+    /* FIXME: transfers beyond the bounce buffer use polled PIO, whose FIFO stalls can fail high-speed blocks with CRC errors */
+    UseIdmac = DwMmcUseIdmac(FdoExtension, TotalBytes);
 
     RtlZeroMemory(LocalResponse, sizeof(LocalResponse));
     DwMmcWrite(FdoExtension, DWMMC_CTRL, DwMmcRead(FdoExtension, DWMMC_CTRL) | DWMMC_CTRL_FIFO_RESET);
@@ -605,6 +630,7 @@ DwMmcExecuteDataCommand(
     {
         if (!IsRead)
             RtlCopyMemory(FdoExtension->DmaBuffer, Buffer, TotalBytes);
+        DwMmcWrite(FdoExtension, DWMMC_FIFOTH, DwMmcFifoThreshold(FdoExtension->DwMmcFifoDepth, BlockSize));
         Status = DwMmcIdmacStart(FdoExtension, TotalBytes);
         if (!NT_SUCCESS(Status))
         {

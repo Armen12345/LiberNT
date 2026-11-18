@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # PROJECT:     LiberNT host-native tests
 # LICENSE:     GPL-3.0-or-later (https://spdx.org/licenses/GPL-3.0-or-later)
-# PURPOSE:     DesignWare MMC internal DMA: descriptor chain, completion and error handling against a register model
+# PURPOSE:     DesignWare MMC internal DMA: transfer path, FIFO thresholds, descriptor chain, completion and errors
 # COPYRIGHT:   Copyright 2026 Ahmed ARIF <arif.ing@outlook.com>
 import argparse
 import pathlib
@@ -33,7 +33,8 @@ def function(name):
 
 
 functions = ''.join(function(name) for name in (
-    'DwMmcRead', 'DwMmcWrite', 'DwMmcPollClear', 'DwMmcErrorToStatus', 'DwMmcIdmacStart', 'DwMmcIdmacStop',
+    'DwMmcRead', 'DwMmcWrite', 'DwMmcPollClear', 'DwMmcErrorToStatus', 'DwMmcUseIdmac', 'DwMmcFifoThreshold',
+    'DwMmcIdmacStart', 'DwMmcIdmacStop',
     'DwMmcIdmacFailed', 'DwMmcIdmacWait', 'DwMmcWaitDataDone'))
 
 fixture = r'''
@@ -288,8 +289,48 @@ static void CheckStuckReset(void)
     Check(!(Registers[DWMMC_BMOD / 4] & DWMMC_BMOD_ENABLE), Case, "DMA enabled while its reset was still running");
 }
 
+static void CheckPath(void)
+{
+    const char *Case = "transfer path";
+
+    Reset(TRUE);
+    Check(!DwMmcUseIdmac(&Fdo, 8), Case, "8-byte SCR read sent through the DMA");
+    Check(!DwMmcUseIdmac(&Fdo, 12), Case, "12-byte transfer sent through the DMA");
+    Check(DwMmcUseIdmac(&Fdo, 16), Case, "16-byte transfer kept off the DMA");
+    Check(DwMmcUseIdmac(&Fdo, 512), Case, "one block kept off the DMA");
+    Check(DwMmcUseIdmac(&Fdo, DWMMC_IDMAC_BUFFER_BYTES), Case, "full bounce buffer kept off the DMA");
+    Check(!DwMmcUseIdmac(&Fdo, DWMMC_IDMAC_BUFFER_BYTES + 512), Case,
+          "transfer beyond the bounce buffer sent through the DMA instead of PIO");
+    Check(!DwMmcUseIdmac(&Fdo, 511 * 2048), Case, "511 x 2048-byte SDIO transfer sent through the DMA");
+    Fdo.DwMmcDescriptors = NULL;
+    Check(!DwMmcUseIdmac(&Fdo, 512), Case, "DMA used without a descriptor table");
+}
+
+static void CheckThreshold(ULONG FifoDepth, ULONG BlockSize, ULONG Burst, ULONG RxWatermark)
+{
+    static const ULONG Bursts[] = { 1, 4, 8, 16, 32, 64, 128, 256 };
+    ULONG Value = DwMmcFifoThreshold(FifoDepth, BlockSize);
+    ULONG Size = Value >> DWMMC_FIFOTH_MSIZE_SHIFT;
+
+    if (Size > 7 || Bursts[Size] != Burst || ((Value >> DWMMC_FIFOTH_RX_SHIFT) & DWMMC_FIFOTH_DEPTH_MASK) != RxWatermark ||
+        (Value & DWMMC_FIFOTH_DEPTH_MASK) != FifoDepth / 2)
+    {
+        printf("FAIL FIFO threshold for a %u-word FIFO and %u-byte blocks: FIFOTH 0x%08x, expected burst %u, "
+               "RX watermark %u, TX watermark %u\n", FifoDepth, BlockSize, Value, Burst, RxWatermark, FifoDepth / 2);
+        Failures++;
+    }
+}
+
 int main(void)
 {
+    CheckPath();
+    CheckThreshold(32, 512, 16, 15);
+    CheckThreshold(32, 64, 16, 15);
+    CheckThreshold(32, 32, 8, 7);
+    CheckThreshold(32, 8, 1, 1);
+    CheckThreshold(32, 12, 1, 1);
+    CheckThreshold(16, 512, 8, 7);
+    CheckThreshold(256, 512, 128, 127);
     CheckChain("one 512-byte block", 512);
     CheckChain("one full descriptor", DWMMC_IDMAC_CHUNK_BYTES);
     CheckChain("64 KB plus one block", 64 * 1024 + 512);
