@@ -18,5 +18,7 @@ if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Linux")
     if(Python3_Interpreter_FOUND)
         add_test(NAME ndis.rwlock COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/rwlock-test.py
             --root ${REACTOS_HOST_SOURCE_ROOT} --cc ${CMAKE_C_COMPILER})
+        add_test(NAME ndis.addressing_reset COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/addressing-reset-test.py
+            --root ${REACTOS_HOST_SOURCE_ROOT} --cc ${CMAKE_C_COMPILER})
     endif()
 endif()

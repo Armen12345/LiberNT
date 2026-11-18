@@ -111,6 +111,7 @@ typedef struct _LOGICAL_ADAPTER
     EX_RUNDOWN_REF              HangTimerRundown;       /* Keeps adapter alive through queued DPCs */
     BOOLEAN                     HangTimerInitialized;
     BOOLEAN                     HangTimerStopping;
+    EX_RUNDOWN_REF              AddressingResetRundown; /* Keeps the miniport from halting under a queued addressing reset */
 
     /* Cached lookahead buffer for the legacy (NDIS_STATUS_RESOURCES) receive
      * path. Allocated on first use and reused for the life of the adapter so
@@ -118,6 +119,10 @@ typedef struct _LOGICAL_ADAPTER
      * holding NdisMiniportBlock.Lock. Guarded by that same lock. */
     PVOID                       LookaheadCache;
     UINT                        LookaheadCacheSize;
+
+    /* One slot for every processor: NDIS_MINIPORT_BLOCK only has room for the first MAXIMUM_PROCESSORS */
+    ULONG                       IndicatedPacketSlots;
+    PNDIS_PACKET                IndicatedPackets[ANYSIZE_ARRAY];
 } LOGICAL_ADAPTER, *PLOGICAL_ADAPTER;
 
 #define GET_LOGICAL_ADAPTER(Handle)((PLOGICAL_ADAPTER)Handle)
