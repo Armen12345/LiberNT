@@ -87,6 +87,9 @@ typedef struct _FDO_EXTENSION {
     ULONG DwMmcDataOffset;
     ULONG DwMmcBusWidth;
     BOOLEAN DwMmcNeedInit;
+    BOOLEAN DwMmcHighSpeed;
+    struct _DWMMC_IDMAC_DESCRIPTOR *DwMmcDescriptors;
+    ULONG DwMmcDescriptorsPhysical;
 
     /* Optional hardware-specific controller extension */
     PVOID HardwareExtension;

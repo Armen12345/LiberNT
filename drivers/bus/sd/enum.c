@@ -738,6 +738,10 @@ SdBusEnableSdHighSpeed(
         HostCtrl |= SDHCI_HC_HIGH_SPEED;
         SdBusWriteReg8(FdoExtension, SDHCI_HOST_CONTROL, HostCtrl);
     }
+    else if (FdoExtension->HostType == SdBusHostDwmmc)
+    {
+        FdoExtension->DwMmcHighSpeed = TRUE;
+    }
 
     DPRINT1("SdBusEnableSdHighSpeed: SD high-speed mode enabled\n");
     return STATUS_SUCCESS;
@@ -1358,6 +1362,7 @@ SdBusEnumerateCard(
     LARGE_INTEGER Delay;
 
     RtlZeroMemory(Response, sizeof(Response));
+    FdoExtension->DwMmcHighSpeed = FALSE;
     Delay.QuadPart = -10000LL;
     IsEmbeddedSlot =
         ((FdoExtension->HostCapabilities & SDHCI_CAP_SLOT_TYPE_MASK) ==
@@ -2027,9 +2032,16 @@ SdBusEnumerateCard(
                 {
                     UCHAR HostCtrl;
 
-                    HostCtrl = SdBusReadReg8(FdoExtension, SDHCI_HOST_CONTROL);
-                    HostCtrl |= SDHCI_HC_HIGH_SPEED;
-                    SdBusWriteReg8(FdoExtension, SDHCI_HOST_CONTROL, HostCtrl);
+                    if (FdoExtension->HostType == SdBusHostDwmmc)
+                    {
+                        FdoExtension->DwMmcHighSpeed = TRUE;
+                    }
+                    else
+                    {
+                        HostCtrl = SdBusReadReg8(FdoExtension, SDHCI_HOST_CONTROL);
+                        HostCtrl |= SDHCI_HC_HIGH_SPEED;
+                        SdBusWriteReg8(FdoExtension, SDHCI_HOST_CONTROL, HostCtrl);
+                    }
                     PdoExtension->ExtCsd[EMMC_EXT_CSD_HS_TIMING] =
                         EMMC_TIMING_HIGH_SPEED;
                     DPRINT1("SdBusEnumerateCard: eMMC high-speed mode enabled\n");
@@ -2435,7 +2447,8 @@ SdBusSetTransferClock(
     UCHAR HostCtrl;
     NTSTATUS Status;
 
-    if (PdoExtension->CardType != SdCardTypeEmmc &&
+    if (FdoExtension->HostType != SdBusHostDwmmc &&
+        PdoExtension->CardType != SdCardTypeEmmc &&
         PdoExtension->CardType != SdCardTypeMmc &&
         PdoExtension->CardType != SdCardTypeSdio)
     {
@@ -2469,7 +2482,10 @@ SdBusSetTransferClock(
     }
 
     /* Pick target clock based on card type and host speed mode */
-    HostCtrl = SdBusReadReg8(FdoExtension, SDHCI_HOST_CONTROL);
+    if (FdoExtension->HostType == SdBusHostDwmmc)
+        HostCtrl = FdoExtension->DwMmcHighSpeed ? SDHCI_HC_HIGH_SPEED : 0;
+    else
+        HostCtrl = SdBusReadReg8(FdoExtension, SDHCI_HOST_CONTROL);
     if (PdoExtension->CardType == SdCardTypeEmmc ||
         PdoExtension->CardType == SdCardTypeMmc)
     {
@@ -2535,9 +2551,16 @@ SdBusSetTransferClock(
     /* Drop out of High Speed timing down to Default Speed (25 MHz). */
     if (HighSpeed)
     {
-        HostCtrl = SdBusReadReg8(FdoExtension, SDHCI_HOST_CONTROL);
-        HostCtrl &= ~SDHCI_HC_HIGH_SPEED;
-        SdBusWriteReg8(FdoExtension, SDHCI_HOST_CONTROL, HostCtrl);
+        if (FdoExtension->HostType == SdBusHostDwmmc)
+        {
+            FdoExtension->DwMmcHighSpeed = FALSE;
+        }
+        else
+        {
+            HostCtrl = SdBusReadReg8(FdoExtension, SDHCI_HOST_CONTROL);
+            HostCtrl &= ~SDHCI_HC_HIGH_SPEED;
+            SdBusWriteReg8(FdoExtension, SDHCI_HOST_CONTROL, HostCtrl);
+        }
 
         DPRINT1("SdBusSetTransferClock: High Speed failed, falling back to "
                 "Default Speed (%lu kHz)\n", (ULONG)SD_DEFAULT_SPEED_KHZ);

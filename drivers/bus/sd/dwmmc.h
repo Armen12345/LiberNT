@@ -30,6 +30,14 @@
 #define DWMMC_STATUS                    0x048
 #define DWMMC_FIFOTH                    0x04C
 #define DWMMC_VERID                     0x06C
+#define DWMMC_HCON                      0x070
+#define DWMMC_BMOD                      0x080
+#define DWMMC_PLDMND                    0x084
+#define DWMMC_DBADDR                    0x088
+#define DWMMC_IDSTS                     0x08C
+#define DWMMC_IDINTEN                   0x090
+#define DWMMC_DSCADDR                   0x094
+#define DWMMC_BUFADDR                   0x098
 #define DWMMC_DATA_OFFSET               0x100
 #define DWMMC_DATA_240A_OFFSET          0x200
 #define DWMMC_VERSION_240A              0x240A
@@ -38,6 +46,8 @@
 #define DWMMC_CTRL_FIFO_RESET           (1UL << 1)
 #define DWMMC_CTRL_DMA_RESET            (1UL << 2)
 #define DWMMC_CTRL_INT_ENABLE           (1UL << 4)
+#define DWMMC_CTRL_DMA_ENABLE           (1UL << 5)
+#define DWMMC_CTRL_USE_IDMAC            (1UL << 25)
 #define DWMMC_CTRL_ALL_RESET            (DWMMC_CTRL_RESET | DWMMC_CTRL_FIFO_RESET | DWMMC_CTRL_DMA_RESET)
 
 #define DWMMC_CLKEN_ENABLE              (1UL << 0)
@@ -81,6 +91,40 @@
 #define DWMMC_STATUS_BUSY               (1UL << 9)
 #define DWMMC_STATUS_FCNT_SHIFT         17
 #define DWMMC_STATUS_FCNT_MASK          0x1FFFUL
+
+#define DWMMC_HCON_DMA_INTERFACE(x)      (((x) >> 16) & 0x3UL)
+#define DWMMC_HCON_DMA_INTERNAL         0UL
+#define DWMMC_HCON_ADDRESS_64BIT        (1UL << 27)
+
+#define DWMMC_BMOD_SWRESET              (1UL << 0)
+#define DWMMC_BMOD_FIXED_BURST          (1UL << 1)
+#define DWMMC_BMOD_ENABLE               (1UL << 7)
+
+#define DWMMC_IDSTS_TI                  (1UL << 0)
+#define DWMMC_IDSTS_RI                  (1UL << 1)
+#define DWMMC_IDSTS_FBE                 (1UL << 2)
+#define DWMMC_IDSTS_ALL                 0xFFFFFFFFUL
+
+#define DWMMC_DES0_LAST                 (1UL << 2)
+#define DWMMC_DES0_FIRST                (1UL << 3)
+#define DWMMC_DES0_CHAINED              (1UL << 4)
+#define DWMMC_DES0_OWN                  (1UL << 31)
+
+#define DWMMC_IDMAC_CHUNK_BYTES         4096UL
+#define DWMMC_IDMAC_BUFFER_BYTES        (256UL * 1024UL)
+#define DWMMC_IDMAC_DESCRIPTOR_COUNT    (DWMMC_IDMAC_BUFFER_BYTES / DWMMC_IDMAC_CHUNK_BYTES)
+#define DWMMC_IDMAC_COMPLETE_TIMEOUT_MS 1000UL
+
+typedef struct _DWMMC_IDMAC_DESCRIPTOR
+{
+    ULONG Control;
+    ULONG Size;
+    ULONG Buffer;
+    ULONG Next;
+} DWMMC_IDMAC_DESCRIPTOR, *PDWMMC_IDMAC_DESCRIPTOR;
+
+C_ASSERT(sizeof(DWMMC_IDMAC_DESCRIPTOR) == 16);
+C_ASSERT(DWMMC_IDMAC_DESCRIPTOR_COUNT * sizeof(DWMMC_IDMAC_DESCRIPTOR) <= PAGE_SIZE);
 
 #define DWMMC_FIFOTH_MSIZE_8            (2UL << 28)
 #define DWMMC_FIFOTH_RX_SHIFT           16

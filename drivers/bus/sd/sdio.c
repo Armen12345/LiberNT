@@ -1239,10 +1239,17 @@ SdBusSdioEnumerateFunctions(
                                              HighSpeed);
                 if (NT_SUCCESS(Status))
                 {
-                    HostCtrl = SdBusReadReg8(FdoExtension,
-                                             SDHCI_HOST_CONTROL);
-                    HostCtrl |= SDHCI_HC_HIGH_SPEED;
-                    SdBusWriteReg8(FdoExtension, SDHCI_HOST_CONTROL, HostCtrl);
+                    if (FdoExtension->HostType == SdBusHostDwmmc)
+                    {
+                        FdoExtension->DwMmcHighSpeed = TRUE;
+                    }
+                    else
+                    {
+                        HostCtrl = SdBusReadReg8(FdoExtension,
+                                                 SDHCI_HOST_CONTROL);
+                        HostCtrl |= SDHCI_HC_HIGH_SPEED;
+                        SdBusWriteReg8(FdoExtension, SDHCI_HOST_CONTROL, HostCtrl);
+                    }
                     DPRINT1("SdBusSdioEnumerateFunctions: SDIO high-speed enabled\n");
                 }
                 else
