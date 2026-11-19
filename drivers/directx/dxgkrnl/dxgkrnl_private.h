@@ -878,6 +878,8 @@ struct _DXGKRNL_ADAPTER
      * Count matches NumberOfChildren.
      */
     PDXGK_CHILD_DESCRIPTOR      ChildDescriptors;
+    struct _DXGK_CHILD_CONNECTION_RECORD *ChildConnectionRecords;
+    ULONG                       ChildConnectionRecordCount;
     DECLSPEC_ALIGN(8) volatile LONG64 ChildEnumerationEpoch;
     volatile LONG               ChildRelationsEnumerated;
 
@@ -1270,6 +1272,7 @@ struct _DXGKRNL_ADAPTER
     BOOLEAN                     FirmwareTimingValid;
     D3DDDI_VIDEO_PRESENT_TARGET_ID FirmwareTargetId;
     D3DKMDT_VIDEO_SIGNAL_INFO   FirmwareTargetTiming;
+    D3DKMDT_WIRE_FORMAT_AND_PREFERENCE FirmwareWireFormat;
     BOOLEAN                     SystemDisplayEnabled;
     D3DDDIFORMAT                SystemDisplayColorFormat;
 
