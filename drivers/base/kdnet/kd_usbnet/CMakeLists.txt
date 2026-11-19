@@ -12,7 +12,7 @@ add_library(kdusbnetcore ${SOURCE})
 if(NOT MSVC)
     target_compile_options(kdusbnetcore PRIVATE -fno-builtin)
 endif()
-add_dependencies(kdusbnetcore psdk xdk)
+add_dependencies(kdusbnetcore psdk xdk bugcodes)
 
 spec2def(kd_usbnet.dll kd_usbnet.spec)
 
