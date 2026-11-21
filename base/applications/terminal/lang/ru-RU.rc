@@ -1,0 +1,116 @@
+LANGUAGE LANG_RUSSIAN, SUBLANG_DEFAULT
+
+STRINGTABLE
+BEGIN
+    IDS_APP_TITLE               "Терминал"
+    IDS_NEW_TAB                 "Новая вкладка"
+    IDS_SETTINGS                "Параметры"
+    IDS_ABOUT                   "О программе"
+    IDS_CLOSE_ALL_TABS          "У этого окна есть несколько вкладок. Закрыть все?"
+    IDS_CLOSE_ALL_TABS_TITLE    "Закрыть все вкладки"
+    IDS_PROCESS_EXITED          "[The process exited with code %lu. Press Enter to close this tab.]"
+    IDS_START_FAILED            "Этот профиль не может быть запущен.\r\n\r\n%s"
+    IDS_SETTINGS_ERROR          "Параметры терминала"
+    IDS_FIND_HINT               "Найти"
+    IDS_FIND_COUNT              "%d из %d"
+    IDS_FIND_NONE               "Нет результатов"
+    IDS_RENAME_TAB              "Переименовать вкладку"
+    IDS_OPEN_SETTINGS_FILE      "Open settings file"
+    IDS_DUPLICATE_TAB           "Дублировать вкладку"
+    IDS_CLOSE_TAB               "Закрыть вкладку"
+    IDS_CLOSE_OTHER_TABS        "Закрыть остальные вкладки"
+    IDS_CLOSE_TABS_RIGHT        "Close tabs to the right"
+    IDS_COPYRIGHT               "(C) Copyright 2026 LiberNT Team."
+    IDS_VERSION_LINE            "Версия 1.0"
+    IDS_DESCRIPTION             "Терминал с поддержкой вкладок для командной строки, PowerShell и оболочек Linux."
+    IDS_COPY                    "Копировать"
+    IDS_PASTE                   "Вставить"
+    IDS_SELECT_ALL              "Выбрать все"
+    IDS_FIND                    "Найти"
+    IDS_CLEAR_BUFFER            "Очистить буфер"
+    IDS_PROFILE_NEW             "Новый профиль"
+    IDS_SCHEME_NEW              "Новая схема"
+    IDS_SETTINGS_SAVED          "Параметры были сохранены."
+    IDS_SETTINGS_SAVE_FAILED    "Параметры не сохранены"
+
+    IDS_THEME_SYSTEM            "Используйте системный параметр"
+    IDS_THEME_LIGHT             "Light"
+    IDS_THEME_DARK              "Dark"
+    IDS_CURSOR_BAR              "Bar"
+    IDS_CURSOR_BLOCK            "Filled box"
+    IDS_CURSOR_UNDERLINE        "Underscore"
+    IDS_EXIT_GRACEFUL           "Close if it exits successfully"
+    IDS_EXIT_ALWAYS             "Always close"
+    IDS_EXIT_NEVER              "Оставить вкладку открытой"
+    IDS_COLUMN_ACTION           "Действие"
+    IDS_COLUMN_KEYS             "Ключи"
+    IDS_COLOR_FOREGROUND        "Foreground"
+    IDS_COLOR_BACKGROUND        "Фон"
+    IDS_COLOR_CURSOR            "Курсор"
+    IDS_COLOR_SELECTION         "Выделение"
+
+    IDS_SETTINGS_WINDOW         "Параметры терминала"
+    IDS_SET_SECTION_PROFILES    "Профили"
+    IDS_SET_SECTION_COLORS      "Цвета"
+    IDS_SET_SECTION_WINDOW      "Окно"
+    IDS_SET_SECTION_KEYS        "Ключи"
+    IDS_SET_ADD                 "Новый"
+    IDS_SET_NAME                "Имя"
+    IDS_SET_COMMAND             "Command line"
+    IDS_SET_DIRECTORY           "Starting directory"
+    IDS_SET_TAB_TITLE           "Имя вкладки"
+    IDS_SET_FONT                "Шрифт и размер"
+    IDS_SET_BOLD                "Жирный"
+    IDS_SET_CURSOR              "Cursor"
+    IDS_SET_BLINK               "Blink"
+    IDS_SET_HISTORY             "Lines of history"
+    IDS_SET_PADDING             "Padding"
+    IDS_SET_ON_EXIT             "When the process exits"
+    IDS_SET_KEEP_TITLE          "Keep the tab title given here"
+    IDS_SET_BELL_SOUND          "Play a sound for the bell"
+    IDS_SET_HIDDEN              "Hide from the new tab menu"
+    IDS_SET_SCHEME_NAME         "Имя схемы"
+    IDS_SET_SCHEME_COLORS       "Text and cursor"
+    IDS_SET_PALETTE             "Palette"
+    IDS_SET_DEFAULT_PROFILE     "Профиль по умолчанию"
+    IDS_SET_THEME               "Тема"
+    IDS_SET_WINDOW_SIZE         "Размер нового окна"
+    IDS_SET_COLUMNS             "columns"
+    IDS_SET_ROWS                "rows"
+    IDS_SET_WORD_DELIMITERS     "Word delimiters"
+    IDS_SET_COPY_ON_SELECT      "Copy text as soon as it is selected"
+    IDS_SET_CONFIRM_CLOSE       "Ask before closing a window with several tabs"
+    IDS_SET_BELL_MARK           "Mark background tabs that ring the bell"
+    IDS_SET_DUPLICATE           "Дублировать"
+    IDS_SET_DELETE              "Удалить"
+    IDS_SET_BROWSE              "Browse..."
+    IDS_SET_ASSIGN              "Assign"
+    IDS_SET_REMOVE              "Убрать"
+    IDS_SET_RESET               "Reset all"
+    IDS_SET_SAVE                "Сохранить"
+    IDS_SET_CANCEL              "Отмена"
+    IDS_SET_OPEN_JSON           "Редактировать settings.json"
+END
+
+IDD_ABOUT DIALOGEX 0, 0, 250, 104
+STYLE DS_SHELLFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "About Terminal"
+FONT 8, "MS Shell Dlg"
+BEGIN
+    ICON            "", IDC_ABOUT_ICON, 12, 12, 32, 32
+    LTEXT           "", IDC_ABOUT_NAME, 54, 12, 186, 10
+    LTEXT           "", IDC_ABOUT_VERSION, 54, 25, 186, 10
+    LTEXT           "", IDC_ABOUT_COPYRIGHT, 54, 38, 186, 10
+    LTEXT           "", IDC_ABOUT_DESCRIPTION, 54, 54, 186, 22
+    DEFPUSHBUTTON   "OK", IDOK, 190, 82, 50, 14
+END
+
+IDD_RENAME DIALOGEX 0, 0, 220, 58
+STYLE DS_SHELLFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Rename tab"
+FONT 8, "MS Shell Dlg"
+BEGIN
+    EDITTEXT        IDC_RENAME_EDIT, 7, 9, 206, 14, ES_AUTOHSCROLL
+    DEFPUSHBUTTON   "OK", IDOK, 108, 36, 50, 14
+    PUSHBUTTON      "Отмена", IDCANCEL, 163, 36, 50, 14
+END
