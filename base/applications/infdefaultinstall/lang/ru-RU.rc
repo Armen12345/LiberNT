@@ -1,0 +1,12 @@
+LANGUAGE LANG_RUSSIAN, SUBLANG_DEFAULT
+
+STRINGTABLE
+BEGIN
+    IDS_SUCCESS "Операция успешно завершена."
+    IDS_FAILED "Установка не удалась."
+    IDS_UNSUPPORTED "INF-файл, выбранный вами, не поддерживает этот метод установки"
+    IDS_USAGE "Использование: InfDefaultInstall.exe <INF file>"
+    IDS_NO_SECTION "Требуемая секция не была найдена в INF."
+    IDS_ERROR_TITLE "Ошибка"
+    IDS_INSTALL_ERROR "Ошибка установки"
+END
