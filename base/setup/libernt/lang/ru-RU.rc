@@ -182,8 +182,8 @@ BEGIN
     IDS_ACCOUNTZONESUBTITLE "С этой учетной записью вы входите в LiberNT. LiberNT показывает время выбранного часового пояса."
     IDS_READYTITLE "Все готово к установке"
     IDS_READYSUBTITLE "Проверьте выбранные параметры. Изменение дисков начнется после нажатия «Установить»."
-    IDS_DONETITLE "LiberNT установлен"
-    IDS_ABORTTITLE "LiberNT не установлен"
+    IDS_DONETITLE "LiberNT установлена"
+    IDS_ABORTTITLE "LiberNT не установлена"
     IDS_DONE_REBOOT "Через несколько секунд компьютер перезагрузится и запустит LiberNT. Больше не загружайтесь с установочного носителя.\n\nНажмите «Перезагрузить», чтобы перезагрузить сейчас."
     IDS_ABORT_REBOOT "Установка не завершена. Через несколько секунд компьютер перезагрузится.\n\nНажмите «Перезагрузить», чтобы перезагрузить сейчас."
     IDS_BACKBTN "&Назад"
@@ -312,7 +312,7 @@ BEGIN
 
     IDS_CREATE_REGISTRY "Создание реестра..."
 
-    // IDS_INSTALL_FINALIZE "Finalizing the installation..."
+    // IDS_INSTALL_FINALIZE "Завершение установку..."
     IDS_INSTALL_BOOTLOADER "Установка загрузчика..."
 END
 
@@ -406,7 +406,7 @@ IDD_UPGRADEPAGE DIALOGEX 0, 0, 290, 160
 STYLE DS_SHELLFONT | DS_CONTROL | WS_CHILD
 FONT 8, "MS Shell Dlg"
 BEGIN
-    AUTORADIOBUTTON "&Upgrade: install this version and keep files, settings and apps", IDC_UPGRADE_KEEP, 0, 0, 290, 10, WS_GROUP | WS_TABSTOP
+    AUTORADIOBUTTON "&Обновление: установить эту версию и оставить файлы, настройки и приложения", IDC_UPGRADE_KEEP, 0, 0, 290, 10, WS_GROUP | WS_TABSTOP
     COMBOBOX IDC_UPGRADE_LIST, 12, 14, 278, 120, CBS_DROPDOWNLIST | WS_VSCROLL | WS_GROUP | WS_TABSTOP
     AUTORADIOBUTTON "", IDC_UPGRADE_NEW, 0, 36, 290, 10, WS_GROUP | WS_TABSTOP
     LTEXT "", IDC_UPGRADE_NOTE, 0, 56, 290, 44, SS_NOPREFIX
@@ -418,8 +418,8 @@ END
 
 STRINGTABLE
 BEGIN
-    IDS_UPGRADETITLE "Upgrade LiberNT"
-    IDS_UPGRADESUBTITLE "LiberNT is already installed on this computer."
+    IDS_UPGRADETITLE "Обновить LiberNT"
+    IDS_UPGRADESUBTITLE "LiberNT готова к установке на этот компьютер."
     IDS_UPGRADE_NEW_INSTALL "&Custom: install a new copy of LiberNT (advanced)"
     IDS_UPGRADE_NEW_COPY "&Don't upgrade: set up this copy of LiberNT instead"
     IDS_UPGRADE_ENTRY "%s - %s"
@@ -428,12 +428,12 @@ BEGIN
     IDS_UPGRADE_HIBERNATED "LiberNT on %s is hibernated, so it cannot be upgraded safely. Start it, shut it down fully, then start Setup again."
     IDS_UPGRADE_READYTITLE "Ready to upgrade"
     IDS_UPGRADE_READYSUBTITLE "Review your choice. Setup starts upgrading LiberNT when you click Upgrade."
-    IDS_UPGRADEBTN "&Upgrade"
-    IDS_READY_UPGRADE "LiberNT on %s is upgraded from %s to %s."
+    IDS_UPGRADEBTN "&Обновить"
+    IDS_READY_UPGRADE "LiberNT на %s обновлена с %s до %s."
     IDS_READY_UPGRADE_KEEP "Your files, apps, user accounts and settings are kept. The LiberNT system files, the registry entries of the system and the bootloader are replaced. No partition is created, deleted or formatted."
-    IDS_UPGRADE_PROCESSTITLE "Upgrading LiberNT"
+    IDS_UPGRADE_PROCESSTITLE "Обновление LiberNT"
     IDS_UPGRADE_PROCESSSUBTITLE "Setup replaces the system files, updates the registry and installs the bootloader. Your files, apps and settings are kept. This can take a few minutes."
-    IDS_UPGRADE_DONETITLE "LiberNT is upgraded"
+    IDS_UPGRADE_DONETITLE "LiberNT обновлена"
 END
 
 IDD_UPDATECHECKPAGE DIALOGEX 0, 0, 290, 160
@@ -451,7 +451,7 @@ BEGIN
     LTEXT "What's new:", IDC_STATIC, 0, 0, 290, 9
     EDITTEXT IDC_UPDATE_NOTES, 0, 11, 290, 110, ES_MULTILINE | ES_READONLY | WS_VSCROLL | NOT WS_TABSTOP
     LTEXT "", IDC_UPDATE_SIZE, 0, 129, 190, 9, SS_NOPREFIX
-    PUSHBUTTON "&Remind me later", IDC_UPDATE_LATER, 200, 126, 90, 14
+    PUSHBUTTON "&Напомнить позже", IDC_UPDATE_LATER, 200, 126, 90, 14
 END
 
 IDD_UPDATEREADYPAGE DIALOGEX 0, 0, 290, 160
@@ -468,17 +468,17 @@ BEGIN
     IDS_UPDATE_CHECKING "Checking for updates..."
     IDS_UPDATE_UPTODATE "LiberNT is up to date (build %lu)."
     IDS_UPDATE_CHECKFAILED "LiberNT could not check for updates (error 0x%08lx). Check the network connection and try again later."
-    IDS_UPDATE_TITLE "A LiberNT update is available"
+    IDS_UPDATE_TITLE "Доступно обновление LiberNT"
     IDS_UPDATE_SUBTITLE "%s (update %lu)"
     IDS_UPDATE_SIZE "Download size: %s"
-    IDS_UPDATE_DOWNLOADBTN "&Download"
+    IDS_UPDATE_DOWNLOADBTN "&Скачать"
     IDS_UPDATE_LATERBTN "Restart &later"
     IDS_UPDATE_DOWNLOADTITLE "Getting the update ready"
     IDS_UPDATE_DOWNLOADSUBTITLE "You can keep using your computer while LiberNT downloads and prepares the update."
-    IDS_UPDATE_DOWNLOADING "Downloading %s"
-    IDS_UPDATE_DOWNLOADED "%s of %s"
+    IDS_UPDATE_DOWNLOADING "Скачивание %s"
+    IDS_UPDATE_DOWNLOADED "%s из %s"
     IDS_UPDATE_VERIFYING "Checking the download of %s"
-    IDS_UPDATE_EXTRACTING "Unpacking %s"
+    IDS_UPDATE_EXTRACTING "Распаковка %s"
     IDS_UPDATE_PREPARING "Preparing the restart into Setup for %s"
     IDS_UPDATE_STAGEFAILED "The update could not be prepared (error 0x%08lx)."
     IDS_UPDATE_READYTITLE "Restart to install the update"
@@ -489,10 +489,10 @@ BEGIN
     IDS_UPDATE_NOTIFYSTAGED "%s is ready to install. Restart your computer to install it."
     IDS_UPDATE_COMPLETETITLE "Finishing the LiberNT update"
     IDS_UPDATE_COMPLETESUBTITLE "Your files, apps and settings are kept. Your computer restarts when this is done."
-    IDS_UPDATE_COMPLETE_REGISTRY "Updating system settings"
-    IDS_UPDATE_COMPLETE_COMPONENTS "Configuring system components"
+    IDS_UPDATE_COMPLETE_REGISTRY "Обновление системных параметров"
+    IDS_UPDATE_COMPLETE_COMPONENTS "Конфигурация системных компонентов"
     IDS_UPDATE_COMPLETE_CLEANUP "Cleaning up"
-    IDS_UPDATE_COMPLETE_FAILED "%s could not be installed. LiberNT keeps the version you had."
+    IDS_UPDATE_COMPLETE_FAILED "%s не получилось установить. LiberNT оставляет старую версию."
     IDS_UPDATE_COMPLETE_RETRYBOOT "LiberNT could not finish installing %s. It tries again when you restart your computer."
     IDS_UPDATE_COMPLETE_RETRYLOGON "LiberNT could not finish setting up %s. It tries again the next time an administrator signs in."
     IDS_UPDATE_COMPLETE_NOSPACE "%s could not be installed because the system drive does not have enough free space. LiberNT keeps the version you had and offers the update again."
@@ -501,8 +501,8 @@ END
 
 STRINGTABLE
 BEGIN
-    IDS_HOST_STARTTITLE "Install or upgrade LiberNT"
-    IDS_HOST_STARTSUBTITLE "LiberNT is already installed on this computer."
+    IDS_HOST_STARTTITLE "Установить или обновить LiberNT"
+    IDS_HOST_STARTSUBTITLE "LiberNT уже установлена на этом компьютере."
     IDS_HOST_INSTALLNEW "&Install a new copy of LiberNT alongside %s"
     IDS_HOST_UPGRADENOTE "Upgrade replaces the LiberNT system files with this version and keeps your files, the apps you installed, the user accounts and the settings. The computer restarts, and LiberNT installs the upgrade while it starts.\n\nThis version: %s"
     IDS_HOST_INSTALLNOTE "%s gives part of its space to a new partition, and the computer restarts into LiberNT Setup, which installs LiberNT there.\n\nThis version: %s"
@@ -543,8 +543,8 @@ BEGIN
     IDS_HOST_FIRMWAREBTN "Restart to the firmware settings"
     IDS_HOST_PENDING_TITLE "LiberNT Setup is ready to continue"
     IDS_HOST_PENDING "Setup already prepared a %s partition for LiberNT on this computer. Continue to copy the image again and restart into LiberNT Setup, or undo the preparation to give the space back to %s."
-    IDS_HOST_CONTINUEBTN "Continue the installation"
-    IDS_HOST_UNDOBTN "Undo the preparation"
+    IDS_HOST_CONTINUEBTN "Продолжить установку"
+    IDS_HOST_UNDOBTN "Остановить подготовку"
     IDS_HOST_UNDONE "The preparation was undone, and %s has its space back."
     IDS_HOST_UNDOFAILED "The preparation could not be undone completely (error %lu, 0x%08lx). Use Disk Management to delete the LiberNT partition and to extend %s."
     IDS_HOST_INUSE "An upgrade of LiberNT on %s is not finished. Start LiberNT to finish it or to roll it back, then start Setup again."
