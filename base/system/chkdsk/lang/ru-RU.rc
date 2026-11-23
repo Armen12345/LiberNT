@@ -29,5 +29,5 @@ BEGIN
     IDS_NO_CURRENT_DIR "Не удалось получить текущую директорию. Код ошибки: "
     IDS_NO_QUERY_VOL "Не удалось запросить том. Код ошибки: "
     IDS_VOLUME_IN_USE_PROC "Chkdsk не может быть запущен, так как том занят другим процессом.\n\n"
-    IDS_RUN_AGAIN "It may be possible to fix this by running chkdsk again.\n\n"
+    IDS_RUN_AGAIN "Возможно, это удастся исправить, повторно запустив chkdsk.\n\n"
 END
