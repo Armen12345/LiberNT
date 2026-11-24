@@ -235,7 +235,7 @@ void NativeContext::CopyStateTo(NativeContext *destination)
     destination->SOSetTargets(4, stream_outputs, append);
     for (UINT stage = 0; stage < 6; ++stage)
     {
-        destination->SetConstantBuffers(stage, 0, 14, constant_buffers[stage]);
+        RestoreConstantBuffers(destination, stage, 0, 14);
         destination->SetSamplers(stage, 0, 16, samplers[stage]);
         destination->SetShaderResources(stage, 0, 128, shader_resources[stage]);
     }
@@ -517,10 +517,14 @@ void NativeDevice::HoldDefaultStates()
             D3D11_DEFAULT_STENCIL_READ_MASK, D3D11_DEFAULT_STENCIL_WRITE_MASK, face, face};
     static const D3D11_RASTERIZER_DESC rasterizer = {D3D11_FILL_SOLID, D3D11_CULL_BACK, FALSE, 0, 0.0f, 0.0f, TRUE,
             FALSE, FALSE, FALSE};
+    static const D3D11_SAMPLER_DESC sampler = {D3D11_FILTER_MIN_MAG_MIP_LINEAR, D3D11_TEXTURE_ADDRESS_CLAMP,
+            D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_TEXTURE_ADDRESS_CLAMP, 0.0f, 1, D3D11_COMPARISON_NEVER,
+            {1.0f, 1.0f, 1.0f, 1.0f}, -FLT_MAX, FLT_MAX};
     D3D11_BLEND_DESC blend = {FALSE, FALSE, {target}};
     ID3D11BlendState *blend_state = NULL;
     ID3D11DepthStencilState *depth_state = NULL;
     ID3D11RasterizerState *rasterizer_state = NULL;
+    ID3D11SamplerState *sampler_state = NULL;
 
     if (!default_blend_state && SUCCEEDED(CreateBlendState(&blend, &blend_state)))
         NativeHoldDefault(default_blend_state, blend_state);
@@ -528,6 +532,8 @@ void NativeDevice::HoldDefaultStates()
         NativeHoldDefault(default_depth_stencil_state, depth_state);
     if (!default_rasterizer_state && SUCCEEDED(CreateRasterizerState(&rasterizer, &rasterizer_state)))
         NativeHoldDefault(default_rasterizer_state, rasterizer_state);
+    if (!default_sampler_state && SUCCEEDED(CreateSamplerState(&sampler, &sampler_state)))
+        NativeHoldDefault(default_sampler_state, sampler_state);
 }
 
 UINT NativeContext::CountBindings(const void *object) const

@@ -169,7 +169,8 @@ NtfsFindIndexInsertionPoint(
     _Out_ PULONG InsertionOffset,
     _Out_ PULONGLONG ChildVcn,
     _Out_ PBOOLEAN Descend,
-    _Out_opt_ PBOOLEAN FoundExact)
+    _Out_opt_ PBOOLEAN FoundExact,
+    _In_opt_ PNtfsIndexEntryTable Table)
 {
     PIndexEntry Entry;
     ULONG_PTR End;
@@ -214,6 +215,101 @@ NtfsFindIndexInsertionPoint(
     End =
         reinterpret_cast<ULONG_PTR>(Header) +
         Header->TotalIndexSize;
+
+    /*
+     * Entries are sorted: a node that is sound from end to end is searched by halving. Anything
+     * else is walked in order below, which stops and judges exactly where it always did.
+     */
+    {
+        ULONG LocalOffsets[NTFS_INDEX_SEARCH_ENTRIES];
+        PULONG Offsets = Table ? Table->Offsets : LocalOffsets;
+        ULONG Count = 0;
+        ULONG EndOffset = 0;
+        BOOLEAN Sorted = Table && Table->Valid;
+
+        if (Sorted)
+        {
+            /* A cached node does not change: what its first search checked still holds. */
+            Count = Table->Count;
+            EndOffset = Table->EndOffset;
+            ASSERT(Count <= NTFS_INDEX_SEARCH_ENTRIES && EndOffset < Header->TotalIndexSize);
+        }
+        else
+        {
+            PIndexEntry Walk = Entry;
+
+            while (reinterpret_cast<ULONG_PTR>(Walk) < End)
+            {
+                if (!IsIndexEntryValid(Walk,
+                                       (ULONG)(End - reinterpret_cast<ULONG_PTR>(Walk)),
+                                       Key->CollationRule != ATTRDEF_COLLATION_FILENAME) ||
+                    !!(Walk->Flags & INDEX_ENTRY_NODE) != Large)
+                {
+                    break;
+                }
+                if (Walk->Flags & INDEX_ENTRY_END)
+                {
+                    Sorted = reinterpret_cast<ULONG_PTR>(Walk) + Walk->EntryLength == End;
+                    EndOffset = (ULONG)(reinterpret_cast<PUCHAR>(Walk) - reinterpret_cast<PUCHAR>(Header));
+                    break;
+                }
+                if (Count == NTFS_INDEX_SEARCH_ENTRIES)
+                    break;
+                Offsets[Count++] = (ULONG)(reinterpret_cast<PUCHAR>(Walk) - reinterpret_cast<PUCHAR>(Header));
+                Walk = reinterpret_cast<PIndexEntry>(reinterpret_cast<PUCHAR>(Walk) + Walk->EntryLength);
+            }
+            if (Table)
+            {
+                Table->Count = Count;
+                Table->EndOffset = EndOffset;
+                Table->Valid = Sorted;
+            }
+        }
+        if (Sorted)
+        {
+            ULONG Low = 0;
+            ULONG High = Count;
+            PIndexEntry Next;
+
+            while (Low < High)
+            {
+                ULONG Middle = Low + (High - Low) / 2;
+
+                Status = CompareIndexKey(DiskVolume,
+                                         Key,
+                                         reinterpret_cast<PIndexEntry>(reinterpret_cast<PUCHAR>(Header) +
+                                                                       Offsets[Middle]),
+                                         &Comparison);
+                if (!NT_SUCCESS(Status))
+                    return Status;
+                if (Comparison == 0)
+                {
+                    if (!FoundExact)
+                        return STATUS_OBJECT_NAME_COLLISION;
+                    *FoundExact = TRUE;
+                    *InsertionOffset = Offsets[Middle];
+                    return STATUS_SUCCESS;
+                }
+                if (Comparison < 0)
+                    High = Middle;
+                else
+                    Low = Middle + 1;
+            }
+            Next = reinterpret_cast<PIndexEntry>(reinterpret_cast<PUCHAR>(Header) +
+                                                 (Low < Count ? Offsets[Low] : EndOffset));
+            if (Large)
+            {
+                *ChildVcn = *GetSubnodeVCN(Next);
+                *Descend = TRUE;
+            }
+            else
+            {
+                *InsertionOffset = Low < Count ? Offsets[Low] : EndOffset;
+            }
+            return STATUS_SUCCESS;
+        }
+    }
+
     while (reinterpret_cast<ULONG_PTR>(Entry) <
            End)
     {
@@ -684,7 +780,7 @@ BuildIndexBufferImage(
     return STATUS_SUCCESS;
 }
 
-static NTSTATUS
+NTSTATUS
 WriteIndexNode(
     _In_ PVolume DiskVolume,
     _In_ PFileRecord DirectoryFile,
@@ -695,6 +791,9 @@ WriteIndexNode(
     _Inout_updates_bytes_(RecordSize)
         PUCHAR Image)
 {
+    PNTFSRecordHeader Record = reinterpret_cast<PNTFSRecordHeader>(Image);
+    ULONGLONG Name = NtfsLookupIndexName(IndexName);
+    PNtfsLookupSlot Slot = NULL;
     LARGE_INTEGER WriteOffset;
     ULONGLONG AllocationOffset;
     ULONG WriteLength = RecordSize;
@@ -709,37 +808,56 @@ WriteIndexNode(
         return STATUS_FILE_TOO_LARGE;
     }
 
+    if (Name)
+        Slot = DiskVolume->BeginLookupStore(MakeFileReference(DirectoryFile), Name, Vcn, RecordSize);
+    if (Slot)
+        RtlCopyMemory(Slot->Buffer, Image, RecordSize);
     Status = NtfsCommitFixup(
-        reinterpret_cast<PNTFSRecordHeader>(
-            Image),
+        Record,
         RecordSize,
         DiskVolume->BytesPerSector);
-    if (!NT_SUCCESS(Status))
-        return Status;
-
-    WriteOffset.QuadPart =
-        (LONGLONG)AllocationOffset;
-    Status = DirectoryFile->WriteFileData(
-        TypeIndexAllocation,
-        const_cast<PWSTR>(IndexName),
-        Image,
-        &WriteLength,
-        &WriteOffset);
-    if (NT_SUCCESS(Status) &&
-        WriteLength != RecordSize)
+    if (NT_SUCCESS(Status))
     {
-        Status = STATUS_END_OF_FILE;
+        WriteOffset.QuadPart =
+            (LONGLONG)AllocationOffset;
+        Status = DirectoryFile->WriteFileData(
+            TypeIndexAllocation,
+            const_cast<PWSTR>(IndexName),
+            Image,
+            &WriteLength,
+            &WriteOffset);
+        if (NT_SUCCESS(Status) &&
+            WriteLength != RecordSize)
+        {
+            Status = STATUS_END_OF_FILE;
+        }
+    }
+    if (Slot)
+    {
+        /* The copy is the node as used in memory: of the commit it lacks only the new update sequence array. */
+        if (NT_SUCCESS(Status))
+        {
+            ULONG UsaBytes = Record->SizeOfUpdateSequence * sizeof(USHORT);
+
+            ASSERT(Record->UpdateSequenceOffset + UsaBytes <= RecordSize);
+            RtlCopyMemory(Slot->Buffer + Record->UpdateSequenceOffset, Image + Record->UpdateSequenceOffset, UsaBytes);
+        }
+        DiskVolume->EndLookupStore(Slot, NT_SUCCESS(Status));
     }
     return Status;
 }
 
 static NTSTATUS
 SetIndexRecordBitmapBit(
+    _In_ PVolume DiskVolume,
     _In_ PFileRecord DirectoryFile,
     _In_ PCWSTR IndexName,
-    _In_ ULONGLONG RecordOrdinal,
+    _In_ ULONG RecordSize,
+    _In_ ULONGLONG AllocationUnit,
+    _In_ ULONGLONG Vcn,
     _In_ BOOLEAN Value)
 {
+    ULONGLONG RecordOrdinal;
     PAttribute BitmapAttribute;
     LARGE_INTEGER WriteOffset;
     ULONGLONG BitmapLength;
@@ -751,6 +869,9 @@ SetIndexRecordBitmapBit(
     UCHAR BitmapMask;
     NTSTATUS Status;
 
+    if (!RecordSize || Vcn > ~(ULONGLONG)0 / AllocationUnit)
+        return STATUS_FILE_CORRUPT_ERROR;
+    RecordOrdinal = Vcn * AllocationUnit / RecordSize;
     ByteOffset = RecordOrdinal >> 3;
     BitmapMask =
         (UCHAR)(1u << (RecordOrdinal & 7));
@@ -814,6 +935,7 @@ SetIndexRecordBitmapBit(
     else
     {
         BitmapByte &= (UCHAR)~BitmapMask;
+        DiskVolume->InvalidateLookupNode(MakeFileReference(DirectoryFile), NtfsLookupIndexName(IndexName), Vcn);
     }
 
     WriteLength = 1;
@@ -1064,6 +1186,111 @@ BuildRootValueFromList(
  * already-large index. The buffer content becomes durable before the
  * root switch commits the new shape.
  */
+/* The root shrinks only after both new attributes are listed. */
+NTSTATUS
+Directory::PlaceIndexAllocationInExtension(
+    _In_ PVolume DiskVolume,
+    _In_ PFileRecord DirectoryFile,
+    _In_ PCWSTR IndexName,
+    _In_ PUCHAR Image,
+    _In_ ULONG RecordSize,
+    _In_reads_bytes_(RootValueLength) PUCHAR RootValue,
+    _In_ ULONG RootValueLength)
+{
+    const AttributeType Published[] = { TypeIndexAllocation, TypeBitmap };
+    UCHAR InitialBitmap[8] = { 1 };
+    PFileRecord Extension = NULL;
+    PFileRecord RootOwner;
+    PAttribute IndexRootAttribute;
+    PAttribute NewAttribute = NULL;
+    BOOLEAN Referenced = FALSE;
+    NTSTATUS Status;
+
+    ASSERT(DirectoryFile->FindAttributeInRecord(TypeAttributeList, NULL, NULL));
+    Status = DiskVolume->MFT->AllocateExtensionFileRecord(
+        MakeFileReference(DirectoryFile),
+        &Extension);
+    if (!NT_SUCCESS(Status))
+        return Status;
+    Status = Extension->SetAutomaticTimestampMask(0);
+    if (NT_SUCCESS(Status))
+    {
+        Status = Extension->InsertResidentAttribute(
+            TypeBitmap,
+            const_cast<PWSTR>(IndexName),
+            &NewAttribute);
+    }
+    if (NT_SUCCESS(Status))
+    {
+        Status = Extension->ReplaceResidentData(
+            NewAttribute,
+            InitialBitmap,
+            sizeof(InitialBitmap));
+    }
+    if (NT_SUCCESS(Status))
+    {
+        Status = Extension->InsertResidentAttribute(
+            TypeIndexAllocation,
+            const_cast<PWSTR>(IndexName),
+            &NewAttribute);
+    }
+    if (NT_SUCCESS(Status))
+    {
+        Status = Extension->PromoteResidentData(
+            NewAttribute,
+            Image,
+            RecordSize,
+            0,
+            RecordSize,
+            RecordSize);
+    }
+    for (ULONG Index = 0;
+         NT_SUCCESS(Status) && Index < RTL_NUMBER_OF(Published);
+         Index++)
+    {
+        PAttribute Listed = Extension->FindAttributeInRecord(
+            Published[Index],
+            const_cast<PWSTR>(IndexName),
+            NULL);
+        BOOLEAN OwnerReferenced = FALSE;
+
+        Status = Listed
+            ? DirectoryFile->InsertAttributeListEntry(
+                  Listed,
+                  Extension,
+                  0,
+                  FALSE,
+                  &OwnerReferenced)
+            : STATUS_FILE_CORRUPT_ERROR;
+        Referenced = Referenced || OwnerReferenced;
+    }
+    if (!NT_SUCCESS(Status))
+    {
+        /* FIXME: clusters a successful promotion allocated stay allocated on this failure. */
+        if (!Referenced)
+            (void)DiskVolume->MFT->DeallocateExtensionFileRecord(Extension);
+        delete Extension;
+        return Status;
+    }
+    delete Extension;
+
+    IndexRootAttribute = DirectoryFile->GetAttribute(
+        TypeIndexRoot,
+        const_cast<PWSTR>(IndexName));
+    RootOwner = IndexRootAttribute
+        ? DirectoryFile->GetAttributeOwner(IndexRootAttribute)
+        : NULL;
+    if (!RootOwner || IndexRootAttribute->IsNonResident)
+        return STATUS_FILE_CORRUPT_ERROR;
+    Status = RootOwner->ReplaceResidentData(
+        IndexRootAttribute,
+        RootValue,
+        RootValueLength);
+    if (NT_SUCCESS(Status))
+        Status = DiskVolume->MFT->WriteFileRecordToMFT(RootOwner);
+    return Status;
+}
+
 NTSTATUS
 Directory::PushDownRoot(
     _In_ PVolume DiskVolume,
@@ -1139,7 +1366,7 @@ Directory::PushDownRoot(
         Status = BuildIndexBufferImage(
             Image,
             RecordSize,
-            DiskVolume->BytesPerSector,
+            DiskVolume->FixupStride ? DiskVolume->FixupStride : DiskVolume->BytesPerSector,
             0,
             ListInternal,
             List,
@@ -1174,174 +1401,232 @@ Directory::PushDownRoot(
         if (!NT_SUCCESS(Status))
             goto Done;
 
-        IndexRootAttribute =
-            DirectoryFile->GetAttribute(
-                TypeIndexRoot,
-                const_cast<PWSTR>(IndexName));
-        if (!IndexRootAttribute ||
-            IndexRootAttribute->IsNonResident)
+        for (ULONG Attempt = 0;; Attempt++)
         {
-            Status = STATUS_FILE_CORRUPT_ERROR;
-            goto Done;
-        }
-        RootOwner =
-            DirectoryFile->GetAttributeOwner(
-                IndexRootAttribute);
-        if (!RootOwner)
-        {
-            Status = STATUS_FILE_CORRUPT_ERROR;
-            goto Done;
-        }
-
-        BaseBackup =
-            new(PagedPool, TAG_FILE_RECORD)
-                UCHAR[DirectoryFile->
-                    RecordBufferSize];
-        if (!BaseBackup)
-        {
-            Status =
-                STATUS_INSUFFICIENT_RESOURCES;
-            goto Done;
-        }
-        RtlCopyMemory(
-            BaseBackup,
-            DirectoryFile->Data,
-            DirectoryFile->RecordBufferSize);
-        if (RootOwner != DirectoryFile)
-        {
-            OwnerBackup =
-                new(PagedPool, TAG_FILE_RECORD)
-                    UCHAR[RootOwner->
-                        RecordBufferSize];
-            if (!OwnerBackup)
+            OwnerBackup = NULL;
+            BaseBackup = NULL;
+            IndexRootAttribute =
+                DirectoryFile->GetAttribute(
+                    TypeIndexRoot,
+                    const_cast<PWSTR>(IndexName));
+            if (!IndexRootAttribute ||
+                IndexRootAttribute->IsNonResident)
             {
-                delete[] BaseBackup;
+                Status = STATUS_FILE_CORRUPT_ERROR;
+                goto Done;
+            }
+            RootOwner =
+                DirectoryFile->GetAttributeOwner(
+                    IndexRootAttribute);
+            if (!RootOwner)
+            {
+                Status = STATUS_FILE_CORRUPT_ERROR;
+                goto Done;
+            }
+
+            BaseBackup =
+                new(PagedPool, TAG_FILE_RECORD)
+                    UCHAR[DirectoryFile->
+                        RecordBufferSize];
+            if (!BaseBackup)
+            {
                 Status =
                     STATUS_INSUFFICIENT_RESOURCES;
                 goto Done;
             }
             RtlCopyMemory(
-                OwnerBackup,
-                RootOwner->Data,
-                RootOwner->RecordBufferSize);
-        }
-
-        Status = RootOwner->ReplaceResidentData(
-            IndexRootAttribute,
-            RootValue,
-            RootValueLength);
-        if (NT_SUCCESS(Status))
-        {
-            Status =
-                DirectoryFile->
-                    InsertResidentAttribute(
-                        TypeBitmap,
-                        const_cast<PWSTR>(
-                            IndexName),
-                        &NewAttribute);
-        }
-        if (NT_SUCCESS(Status))
-        {
-            Status =
-                DirectoryFile->
-                    ReplaceResidentData(
-                        NewAttribute,
-                        InitialBitmap,
-                        sizeof(InitialBitmap));
-        }
-        if (NT_SUCCESS(Status))
-        {
-            Status =
-                DirectoryFile->
-                    InsertResidentAttribute(
-                        TypeIndexAllocation,
-                        const_cast<PWSTR>(
-                            IndexName),
-                        &NewAttribute);
-        }
-        if (NT_SUCCESS(Status))
-        {
-            Status =
-                DirectoryFile->
-                    PromoteResidentData(
-                        NewAttribute,
-                        Image,
-                        RecordSize,
-                        0,
-                        RecordSize,
-                        RecordSize);
-            if (Status == STATUS_BUFFER_TOO_SMALL)
+                BaseBackup,
+                DirectoryFile->Data,
+                DirectoryFile->RecordBufferSize);
+            if (RootOwner != DirectoryFile)
             {
-                PFileRecord AllocationOwner = DirectoryFile;
-                BOOLEAN ListCreated;
+                OwnerBackup =
+                    new(PagedPool, TAG_FILE_RECORD)
+                        UCHAR[RootOwner->
+                            RecordBufferSize];
+                if (!OwnerBackup)
+                {
+                    delete[] BaseBackup;
+                    Status =
+                        STATUS_INSUFFICIENT_RESOURCES;
+                    goto Done;
+                }
+                RtlCopyMemory(
+                    OwnerBackup,
+                    RootOwner->Data,
+                    RootOwner->RecordBufferSize);
+            }
 
+            Status = RootOwner->ReplaceResidentData(
+                IndexRootAttribute,
+                RootValue,
+                RootValueLength);
+            if (NT_SUCCESS(Status))
+            {
                 Status =
                     DirectoryFile->
-                        EnsureAttributeListForMappingGrowth(
+                        InsertResidentAttribute(
+                            TypeBitmap,
+                            const_cast<PWSTR>(
+                                IndexName),
+                            &NewAttribute);
+            }
+            if (NT_SUCCESS(Status))
+            {
+                Status =
+                    DirectoryFile->
+                        ReplaceResidentData(
+                            NewAttribute,
+                            InitialBitmap,
+                            sizeof(InitialBitmap));
+            }
+            if (NT_SUCCESS(Status))
+            {
+                Status =
+                    DirectoryFile->
+                        InsertResidentAttribute(
                             TypeIndexAllocation,
                             const_cast<PWSTR>(
                                 IndexName),
-                            &NewAttribute,
-                            &AllocationOwner,
-                            &ListCreated);
-                if (NT_SUCCESS(Status) && ListCreated)
+                            &NewAttribute);
+            }
+            if (NT_SUCCESS(Status))
+            {
+                Status =
+                    DirectoryFile->
+                        PromoteResidentData(
+                            NewAttribute,
+                            Image,
+                            RecordSize,
+                            0,
+                            RecordSize,
+                            RecordSize);
+                if (Status == STATUS_BUFFER_TOO_SMALL)
                 {
+                    PFileRecord AllocationOwner = DirectoryFile;
+                    BOOLEAN ListCreated;
+
                     Status =
-                        AllocationOwner->
-                            PromoteResidentData(
-                                NewAttribute,
-                                Image,
-                                RecordSize,
-                                0,
-                                RecordSize,
-                                RecordSize);
-                    if (NT_SUCCESS(Status) &&
-                        AllocationOwner != DirectoryFile)
+                        DirectoryFile->
+                            EnsureAttributeListForMappingGrowth(
+                                TypeIndexAllocation,
+                                const_cast<PWSTR>(
+                                    IndexName),
+                                &NewAttribute,
+                                &AllocationOwner,
+                                &ListCreated);
+                    if (NT_SUCCESS(Status) && ListCreated)
                     {
-                        Status = DiskVolume->MFT->
-                            WriteFileRecordToMFT(
-                                AllocationOwner);
+                        Status =
+                            AllocationOwner->
+                                PromoteResidentData(
+                                    NewAttribute,
+                                    Image,
+                                    RecordSize,
+                                    0,
+                                    RecordSize,
+                                    RecordSize);
+                        if (NT_SUCCESS(Status) &&
+                            AllocationOwner != DirectoryFile)
+                        {
+                            Status = DiskVolume->MFT->
+                                WriteFileRecordToMFT(
+                                    AllocationOwner);
+                        }
+                    }
+                    else if (NT_SUCCESS(Status))
+                    {
+                        Status = STATUS_BUFFER_TOO_SMALL;
                     }
                 }
-                else if (NT_SUCCESS(Status))
+                else if (NT_SUCCESS(Status) &&
+                         DirectoryFile->FindAttributeInRecord(
+                             TypeAttributeList, NULL, NULL))
                 {
-                    Status = STATUS_BUFFER_TOO_SMALL;
+                    const AttributeType Published[] =
+                        { TypeIndexAllocation, TypeBitmap };
+
+                    for (ULONG Index = 0;
+                         NT_SUCCESS(Status) &&
+                             Index < RTL_NUMBER_OF(Published);
+                         Index++)
+                    {
+                        PAttribute Listed =
+                            DirectoryFile->FindAttributeInRecord(
+                                Published[Index],
+                                const_cast<PWSTR>(IndexName),
+                                NULL);
+                        BOOLEAN OwnerReferenced;
+
+                        Status = Listed
+                            ? DirectoryFile->InsertAttributeListEntry(
+                                  Listed,
+                                  DirectoryFile,
+                                  0,
+                                  FALSE,
+                                  &OwnerReferenced)
+                            : STATUS_FILE_CORRUPT_ERROR;
+                    }
                 }
             }
-        }
-        if (NT_SUCCESS(Status) &&
-            RootOwner != DirectoryFile)
-        {
-            Status = DiskVolume->MFT->
-                WriteFileRecordToMFT(RootOwner);
-        }
-        if (!NT_SUCCESS(Status))
-        {
-            RtlCopyMemory(
-                DirectoryFile->Data,
-                BaseBackup,
-                DirectoryFile->
-                    RecordBufferSize);
-            DirectoryFile->Header =
-                reinterpret_cast<
-                    PFileRecordHeader>(
-                        DirectoryFile->Data);
-            DirectoryFile->ClearDataRunCache();
-            if (OwnerBackup)
+            if (NT_SUCCESS(Status) &&
+                RootOwner != DirectoryFile)
+            {
+                Status = DiskVolume->MFT->
+                    WriteFileRecordToMFT(RootOwner);
+            }
+            if (!NT_SUCCESS(Status))
             {
                 RtlCopyMemory(
-                    RootOwner->Data,
-                    OwnerBackup,
-                    RootOwner->RecordBufferSize);
-                RootOwner->Header =
+                    DirectoryFile->Data,
+                    BaseBackup,
+                    DirectoryFile->
+                        RecordBufferSize);
+                DirectoryFile->Header =
                     reinterpret_cast<
                         PFileRecordHeader>(
-                            RootOwner->Data);
-                RootOwner->ClearDataRunCache();
+                            DirectoryFile->Data);
+                DirectoryFile->ClearDataRunCache();
+                if (OwnerBackup)
+                {
+                    RtlCopyMemory(
+                        RootOwner->Data,
+                        OwnerBackup,
+                        RootOwner->RecordBufferSize);
+                    RootOwner->Header =
+                        reinterpret_cast<
+                            PFileRecordHeader>(
+                                RootOwner->Data);
+                    RootOwner->ClearDataRunCache();
+                }
             }
+            delete[] OwnerBackup;
+            delete[] BaseBackup;
+            if (Status == STATUS_BUFFER_TOO_SMALL &&
+                Attempt == 0 &&
+                !DirectoryFile->FindAttributeInRecord(
+                    TypeAttributeList, NULL, NULL))
+            {
+                /* A full base without a list first moves attributes into an extension. */
+                Status = DirectoryFile->CreateInitialAttributeList();
+                if (NT_SUCCESS(Status))
+                    continue;
+            }
+            else if (Status == STATUS_BUFFER_TOO_SMALL &&
+                     DirectoryFile->FindAttributeInRecord(
+                         TypeAttributeList, NULL, NULL))
+            {
+                Status = PlaceIndexAllocationInExtension(
+                    DiskVolume,
+                    DirectoryFile,
+                    IndexName,
+                    Image,
+                    RecordSize,
+                    RootValue,
+                    RootValueLength);
+            }
+            break;
         }
-        delete[] OwnerBackup;
-        delete[] BaseBackup;
         goto Done;
     }
     else
@@ -1358,7 +1643,7 @@ Directory::PushDownRoot(
         Status = BuildIndexBufferImage(
             Image,
             RecordSize,
-            DiskVolume->BytesPerSector,
+            DiskVolume->FixupStride ? DiskVolume->FixupStride : DiskVolume->BytesPerSector,
             Vcn,
             ListInternal,
             List,
@@ -1378,9 +1663,12 @@ Directory::PushDownRoot(
         if (!NT_SUCCESS(Status))
             goto Done;
         Status = SetIndexRecordBitmapBit(
+            DiskVolume,
             DirectoryFile,
             IndexName,
-            RecordOrdinal,
+            RecordSize,
+            AllocationUnit,
+            Vcn,
             TRUE);
         if (!NT_SUCCESS(Status))
             goto Done;
@@ -1414,9 +1702,12 @@ Directory::PushDownRoot(
     {
         NTSTATUS CleanupStatus =
             SetIndexRecordBitmapBit(
+                DiskVolume,
                 DirectoryFile,
                 IndexName,
-                RecordOrdinal,
+                RecordSize,
+                AllocationUnit,
+                Vcn,
                 FALSE);
         if (!NT_SUCCESS(CleanupStatus))
         {
@@ -1480,8 +1771,9 @@ BuildPromotedEntry(
     return STATUS_SUCCESS;
 }
 
+/* The node as on the device: allocated in the bitmap, an INDX record of this VCN, update sequence undone. */
 static NTSTATUS
-ReadIndexNode(
+LoadIndexNode(
     _In_ PVolume DiskVolume,
     _In_ PFileRecord DirectoryFile,
     _In_ PCWSTR IndexName,
@@ -1583,6 +1875,65 @@ ReadIndexNode(
         return STATUS_FILE_CORRUPT_ERROR;
     }
     return STATUS_SUCCESS;
+}
+
+NTSTATUS
+PinIndexNode(
+    _In_ PVolume DiskVolume,
+    _In_ PFileRecord DirectoryFile,
+    _In_ PCWSTR IndexName,
+    _In_ ULONG RecordSize,
+    _In_ ULONGLONG AllocationUnit,
+    _In_ ULONGLONG Vcn,
+    _Inout_ PNtfsLookupSlot* Slot)
+{
+    ULONGLONG FileReference = MakeFileReference(DirectoryFile);
+    ULONGLONG Name = NtfsLookupIndexName(IndexName);
+    PNtfsLookupSlot Held;
+    BOOLEAN Hit;
+    NTSTATUS Status;
+
+    Held = DiskVolume->AcquireLookupSlot(FileReference, Name, Vcn, RecordSize, &Hit, *Slot);
+    *Slot = Held;
+    if (!Held)
+        return STATUS_INSUFFICIENT_RESOURCES;
+    if (Hit)
+        return STATUS_SUCCESS;
+    Held->Valid = FALSE;
+    Held->Table.Valid = FALSE;
+    Status = LoadIndexNode(DiskVolume, DirectoryFile, IndexName, RecordSize, AllocationUnit, Vcn, Held->Buffer);
+    if (!NT_SUCCESS(Status))
+        return Status;
+    Held->FileReference = FileReference;
+    Held->IndexName = Name;
+    Held->VCN = Vcn;
+    Held->Valid = Name != 0;
+    return STATUS_SUCCESS;
+}
+
+/* A copy of the node for the caller to change. */
+static NTSTATUS
+ReadIndexNode(
+    _In_ PVolume DiskVolume,
+    _In_ PFileRecord DirectoryFile,
+    _In_ PCWSTR IndexName,
+    _In_ ULONG RecordSize,
+    _In_ ULONGLONG AllocationUnit,
+    _In_ ULONGLONG Vcn,
+    _Out_writes_bytes_(RecordSize) PUCHAR Image)
+{
+    ULONGLONG Name = NtfsLookupIndexName(IndexName);
+    PNtfsLookupSlot Slot = NULL;
+    NTSTATUS Status;
+
+    if (Name && DiskVolume->CopyLookupNode(MakeFileReference(DirectoryFile), Name, Vcn, Image, RecordSize))
+        return STATUS_SUCCESS;
+    Status = PinIndexNode(DiskVolume, DirectoryFile, IndexName, RecordSize, AllocationUnit, Vcn, &Slot);
+    if (NT_SUCCESS(Status))
+        RtlCopyMemory(Image, Slot->Buffer, RecordSize);
+    if (Slot)
+        DiskVolume->ReleaseLookupSlot(Slot);
+    return Status;
 }
 
 /*
@@ -1724,7 +2075,7 @@ Directory::SplitAndPromote(
         Status = BuildIndexBufferImage(
             SideImage,
             RecordSize,
-            DiskVolume->BytesPerSector,
+            DiskVolume->FixupStride ? DiskVolume->FixupStride : DiskVolume->BytesPerSector,
             NewVcn,
             Internal,
             Scratch + MedianOffset +
@@ -1746,9 +2097,12 @@ Directory::SplitAndPromote(
         if (!NT_SUCCESS(Status))
             goto Done;
         Status = SetIndexRecordBitmapBit(
+            DiskVolume,
             DirectoryFile,
             IndexName,
-            NewOrdinal,
+            RecordSize,
+            AllocationUnit,
+            NewVcn,
             TRUE);
         if (!NT_SUCCESS(Status))
             goto Done;
@@ -1766,7 +2120,7 @@ Directory::SplitAndPromote(
         Status = BuildIndexBufferImage(
             SideImage,
             RecordSize,
-            DiskVolume->BytesPerSector,
+            DiskVolume->FixupStride ? DiskVolume->FixupStride : DiskVolume->BytesPerSector,
             NodeVcn,
             Internal,
             Scratch,
@@ -1974,7 +2328,6 @@ Directory::PushDownResidentRoot(
     {
         return STATUS_INVALID_PARAMETER;
     }
-    DiskVolume->IndexEditGeneration++;
 
     IndexRootAttribute =
         DirectoryFile->GetAttribute(
@@ -2014,9 +2367,7 @@ Directory::PushDownResidentRoot(
         IndexRoot->BytesPerIndexRec !=
             IndexRecordSize ||
         IndexRoot->ClusPerIndexRec !=
-            (UCHAR)
-                DiskVolume->
-                    ClustersPerIndexRecord)
+            IndexRootClustersPerIndexRecord(DiskVolume))
     {
         return STATUS_FILE_CORRUPT_ERROR;
     }
@@ -2091,6 +2442,7 @@ Directory::AddIndexEntry(
     PIndexRootEx IndexRoot;
     PUCHAR NewRootData = NULL;
     PUCHAR IndexBufferData = NULL;
+    PNtfsLookupSlot Pinned = NULL;
     ULONG InsertionOffset;
     ULONG NewRootDataLength;
     ULONG IndexRecordSize;
@@ -2110,7 +2462,6 @@ Directory::AddIndexEntry(
     {
         return STATUS_INVALID_PARAMETER;
     }
-    DiskVolume->IndexEditGeneration++;
 
     IndexRootAttribute =
         DirectoryFile->GetAttribute(
@@ -2151,9 +2502,7 @@ Directory::AddIndexEntry(
         IndexRoot->BytesPerIndexRec !=
             IndexRecordSize ||
         IndexRoot->ClusPerIndexRec !=
-            (UCHAR)
-                DiskVolume->
-                    ClustersPerIndexRecord)
+            IndexRootClustersPerIndexRecord(DiskVolume))
     {
         Status = STATUS_FILE_CORRUPT_ERROR;
         goto Done;
@@ -2318,19 +2667,19 @@ Directory::AddIndexEntry(
         VisitedVcns[VisitedCount++] =
             ChildVcn;
 
-        Status = ReadIndexNode(
+        Status = PinIndexNode(
             DiskVolume,
             DirectoryFile,
             IndexName,
             IndexRecordSize,
             AllocationUnit,
             ChildVcn,
-            IndexBufferData);
+            &Pinned);
         if (!NT_SUCCESS(Status))
             goto Done;
         NodeBuffer =
             reinterpret_cast<PIndexBuffer>(
-                IndexBufferData);
+                Pinned->Buffer);
 
         Descend = FALSE;
         Status = NtfsFindIndexInsertionPoint(
@@ -2342,11 +2691,21 @@ Directory::AddIndexEntry(
             Key,
             &InsertionOffset,
             &ChildVcn,
-            &Descend);
+            &Descend,
+            NULL,
+            &Pinned->Table);
         if (!NT_SUCCESS(Status))
             goto Done;
         if (Descend)
             continue;
+
+        /* Only the leaf changes: it is edited in a copy of its own. */
+        RtlCopyMemory(IndexBufferData, Pinned->Buffer, IndexRecordSize);
+        DiskVolume->ReleaseLookupSlot(Pinned);
+        Pinned = NULL;
+        NodeBuffer =
+            reinterpret_cast<PIndexBuffer>(
+                IndexBufferData);
 
         if (NodeBuffer->
                 IndexHeader.TotalIndexSize >
@@ -2402,6 +2761,8 @@ Directory::AddIndexEntry(
     }
 
 Done:
+    if (Pinned)
+        DiskVolume->ReleaseLookupSlot(Pinned);
     /* Volume-owned scratch. */
     delete[] NewRootData;
     return Status;
@@ -2597,10 +2958,12 @@ ReleaseEndOnlyChain(
             !!(Entry->Flags & INDEX_ENTRY_NODE);
 
         Status = SetIndexRecordBitmapBit(
+            DiskVolume,
             DirectoryFile,
             IndexName,
-            (ChainVcn * AllocationUnit) /
-                RecordSize,
+            RecordSize,
+            AllocationUnit,
+            ChainVcn,
             FALSE);
         if (!NT_SUCCESS(Status))
             break;
@@ -2629,6 +2992,7 @@ RemoveMaxFromSubtree(
     _In_ ULONGLONG AllocationUnit,
     _In_ ULONGLONG Vcn,
     _In_ ULONG Depth,
+    _In_ BOOLEAN ViewIndex,
     _Outptr_result_maybenull_
         PIndexEntry* KeyEntry,
     _Out_ PULONG KeyLength,
@@ -2682,11 +3046,12 @@ RemoveMaxFromSubtree(
     while (reinterpret_cast<ULONG_PTR>(Entry) <
            End)
     {
-        if (!NtfsIsDirectoryIndexEntryValid(
+        if (!IsIndexEntryValid(
                 Entry,
                 (ULONG)(End -
                     reinterpret_cast<ULONG_PTR>(
-                        Entry))))
+                        Entry)),
+                ViewIndex))
         {
             Status = STATUS_FILE_CORRUPT_ERROR;
             goto Done;
@@ -2729,6 +3094,7 @@ RemoveMaxFromSubtree(
             AllocationUnit,
             RightVcn,
             Depth + 1,
+            ViewIndex,
             KeyEntry,
             KeyLength,
             Found,
@@ -3341,10 +3707,12 @@ Directory::ReleaseEmptyIndexNode(
     {
         NTSTATUS ClearStatus =
             SetIndexRecordBitmapBit(
+                DiskVolume,
                 DirectoryFile,
                 IndexName,
-                (Path[Index] * AllocationUnit) /
-                    IndexRecordSize,
+                IndexRecordSize,
+                AllocationUnit,
+                Path[Index],
                 FALSE);
 
         if (!NT_SUCCESS(ClearStatus))
@@ -3372,10 +3740,12 @@ Directory::ReleaseEmptyIndexNode(
                  Index++)
             {
                 (void)SetIndexRecordBitmapBit(
+                    DiskVolume,
                     DirectoryFile,
                     IndexName,
-                    (Path[Index] * AllocationUnit) /
-                        IndexRecordSize,
+                    IndexRecordSize,
+                    AllocationUnit,
+                    Path[Index],
                     TRUE);
             }
             if (ParentIsRoot)
@@ -3455,6 +3825,7 @@ Directory::RemoveIndexEntry(
     PUCHAR NodeImage = NULL;
     PUCHAR RootValue = NULL;
     PUCHAR Scratch = NULL;
+    PNtfsLookupSlot Pinned = NULL;
     ULONG MatchOffset;
     ULONG MaxKeyLength = 0;
     ULONG ReplacementLength = 0;
@@ -3482,7 +3853,6 @@ Directory::RemoveIndexEntry(
     {
         return STATUS_INVALID_PARAMETER;
     }
-    DiskVolume->IndexEditGeneration++;
 
     IndexRootAttribute =
         DirectoryFile->GetAttribute(
@@ -3572,19 +3942,19 @@ Directory::RemoveIndexEntry(
         }
         VisitedVcns[VisitedCount++] = ChildVcn;
 
-        Status = ReadIndexNode(
+        Status = PinIndexNode(
             DiskVolume,
             DirectoryFile,
             IndexName,
             IndexRecordSize,
             AllocationUnit,
             ChildVcn,
-            NodeImage);
+            &Pinned);
         if (!NT_SUCCESS(Status))
             goto Done;
         NodeBuffer =
             reinterpret_cast<PIndexBuffer>(
-                NodeImage);
+                Pinned->Buffer);
         Descend = FALSE;
         Status = NtfsFindIndexInsertionPoint(
             DiskVolume,
@@ -3596,9 +3966,17 @@ Directory::RemoveIndexEntry(
             &MatchOffset,
             &ChildVcn,
             &Descend,
-            &FoundExact);
+            &FoundExact,
+            &Pinned->Table);
         if (!NT_SUCCESS(Status))
             goto Done;
+    }
+    /* Only the node holding the entry changes: it is edited in a copy of its own. */
+    if (Pinned)
+    {
+        RtlCopyMemory(NodeImage, Pinned->Buffer, IndexRecordSize);
+        DiskVolume->ReleaseLookupSlot(Pinned);
+        Pinned = NULL;
     }
 
     /* MatchOffset addresses the entry inside its owning node header. */
@@ -3715,6 +4093,7 @@ Directory::RemoveIndexEntry(
         AllocationUnit,
         RemovedChild,
         0,
+        SearchKey->CollationRule != ATTRDEF_COLLATION_FILENAME,
         &MaxKey,
         &MaxKeyLength,
         &MaxFound,
@@ -3784,7 +4163,7 @@ Directory::RemoveIndexEntry(
             &IndexRoot->Header,
             RemovedChild,
             &MatchOffset,
-            FALSE);
+            Key.CollationRule != ATTRDEF_COLLATION_FILENAME);
         if (!NT_SUCCESS(Status))
             goto Done;
         Matched =
@@ -3957,6 +4336,8 @@ TouchDirectory:
     }
 
 Done:
+    if (Pinned)
+        DiskVolume->ReleaseLookupSlot(Pinned);
     if (MaxKey)
         NtfsFreePool(MaxKey);
     if (Replacement)

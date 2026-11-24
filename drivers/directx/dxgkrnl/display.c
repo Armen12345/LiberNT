@@ -38,16 +38,17 @@
 #include "presenttrace.h"
 #include "vidpn.h"
 #include "display_core.h"
+#include "hotplug_work_core.h"
 #include "pnp.h"
 #include "d3dkmt.h"
 #include <ntddvdeo.h>
 #include <ndk/inbvfuncs.h>
 #include <ntstrsafe.h>
 /* IOCTL_VIDEO_DXGK_* present-path contract, shared with cdd/win32k. */
-#include <reactos/dwmframe.h>
-#include <reactos/rddm/rxgkpresent.h>
-#include <reactos/rddm/rxgkadvcolor.h>
-#include <reactos/rddm/rxgktarget.h>
+#include <libernt/dwmframe.h>
+#include <libernt/rddm/rxgkpresent.h>
+#include <libernt/rddm/rxgkadvcolor.h>
+#include <libernt/rddm/rxgktarget.h>
 
 /* TAG_DXGK_DISPLAY is now in dxgkrnl_private.h */
 
@@ -4170,12 +4171,16 @@ DxgkpPointerBridgeSupported(
 /* Push the tracked pointer position/visibility to the miniport. */
 static NTSTATUS
 DxgkpPointerBridgeSetPosition(
-    _In_ PDXGKRNL_ADAPTER Adapter)
+    _In_ PDXGKRNL_ADAPTER Adapter,
+    _In_ D3DDDI_VIDEO_PRESENT_SOURCE_ID VidPnSourceId)
 {
     PDXGKDDI_SET_POINTER_POSITION PfnSetPosition;
     DXGKARG_SETPOINTERPOSITION PositionArgs;
+    PDXGKRNL_SOURCE_POINTER Pointer;
     NTSTATUS Status = STATUS_UNSUCCESSFUL;
 
+    ASSERT(VidPnSourceId < DXGKRNL_MAX_SOURCE_PRIMARIES);
+    Pointer = &Adapter->Pointers[VidPnSourceId];
     PfnSetPosition = DXGK_CB(Adapter, DxgkDdiSetPointerPosition);
     if (PfnSetPosition == NULL)
         return STATUS_NOT_SUPPORTED;
@@ -4186,11 +4191,10 @@ DxgkpPointerBridgeSetPosition(
         return STATUS_DELETE_PENDING;
 
     RtlZeroMemory(&PositionArgs, sizeof(PositionArgs));
-    PositionArgs.VidPnSourceId = 0;
-    PositionArgs.X = Adapter->PointerX;
-    PositionArgs.Y = Adapter->PointerY;
-    PositionArgs.Flags.Visible = (Adapter->PointerVisible &&
-                                  Adapter->PointerShapeValid) ? 1 : 0;
+    PositionArgs.VidPnSourceId = VidPnSourceId;
+    PositionArgs.X = Pointer->X;
+    PositionArgs.Y = Pointer->Y;
+    PositionArgs.Flags.Visible = (Pointer->Visible && Pointer->ShapeValid) ? 1 : 0;
 
     InterlockedIncrement(&g_PointerPositionCallCount);
     _SEH2_TRY
@@ -4215,13 +4219,18 @@ DxgkpPointerBridgeSetPosition(
 static NTSTATUS
 DxgkpPointerBridgeSetShape(
     _In_ PDXGKRNL_ADAPTER Adapter,
+    _In_ D3DDDI_VIDEO_PRESENT_SOURCE_ID VidPnSourceId,
     _In_reads_bytes_(AttributesSize) PVIDEO_POINTER_ATTRIBUTES Attributes,
     _In_ ULONG AttributesSize)
 {
     PDXGKDDI_SET_POINTER_SHAPE PfnSetShape;
     DXGKARG_SETPOINTERSHAPE ShapeArgs;
+    PDXGKRNL_SOURCE_POINTER Pointer;
     ULONG RequiredSize;
     NTSTATUS Status = STATUS_UNSUCCESSFUL;
+
+    ASSERT(VidPnSourceId < DXGKRNL_MAX_SOURCE_PRIMARIES);
+    Pointer = &Adapter->Pointers[VidPnSourceId];
 
     PfnSetShape = DXGK_CB(Adapter, DxgkDdiSetPointerShape);
     if (PfnSetShape == NULL)
@@ -4255,7 +4264,7 @@ DxgkpPointerBridgeSetShape(
     ShapeArgs.Width = Attributes->Width;
     ShapeArgs.Height = Attributes->Height;
     ShapeArgs.Pitch = DxgkDisplayCorePackPointerRows(Attributes->Pixels, Attributes->Width, Attributes->Height, Attributes->WidthInBytes);
-    ShapeArgs.VidPnSourceId = 0;
+    ShapeArgs.VidPnSourceId = VidPnSourceId;
     ShapeArgs.pPixels = Attributes->Pixels;
     /* The display driver already offset Column/Row by the hot spot. */
     ShapeArgs.XHot = 0;
@@ -4279,16 +4288,114 @@ DxgkpPointerBridgeSetShape(
     if (!NT_SUCCESS(Status))
     {
         InterlockedIncrement(&g_PointerFailureCount);
-        Adapter->PointerShapeValid = FALSE;
+        Pointer->ShapeValid = FALSE;
         return Status;
     }
 
-    Adapter->PointerShapeValid = TRUE;
-    Adapter->PointerX = Attributes->Column;
-    Adapter->PointerY = Attributes->Row;
-    Adapter->PointerVisible = (Attributes->Enable != 0);
+    Pointer->ShapeValid = TRUE;
+    Pointer->X = Attributes->Column;
+    Pointer->Y = Attributes->Row;
+    Pointer->Visible = (Attributes->Enable != 0);
 
-    return DxgkpPointerBridgeSetPosition(Adapter);
+    return DxgkpPointerBridgeSetPosition(Adapter, VidPnSourceId);
+}
+
+/*
+ * The pointer IOCTLs of the display device that scans out VidPnSourceId.
+ * Without a hardware pointer QUERY_POINTER_CAPABILITIES and SET_POINTER_ATTR
+ * fail and the display driver draws a software cursor.
+ */
+static NTSTATUS
+DxgkpPointerControl(
+    _In_opt_ PDXGKRNL_ADAPTER Adapter,
+    _In_ D3DDDI_VIDEO_PRESENT_SOURCE_ID VidPnSourceId,
+    _In_ ULONG IoControlCode,
+    _Inout_opt_ PVOID Buffer,
+    _In_ ULONG InputLength,
+    _In_ ULONG OutputLength,
+    _Out_ PULONG_PTR BytesReturned)
+{
+    BOOLEAN Hardware;
+    PDXGKRNL_SOURCE_POINTER Pointer = NULL;
+
+    PAGED_CODE();
+    *BytesReturned = 0;
+    if (VidPnSourceId >= DXGKRNL_MAX_SOURCE_PRIMARIES)
+        return STATUS_NOT_SUPPORTED;
+    Hardware = Adapter != NULL && DxgkpPointerBridgeSupported(Adapter);
+    if (Hardware)
+        Pointer = &Adapter->Pointers[VidPnSourceId];
+    switch (IoControlCode)
+    {
+        case IOCTL_VIDEO_ENABLE_POINTER:
+            if (!Hardware || !Pointer->ShapeValid)
+                return STATUS_SUCCESS;
+            Pointer->Visible = TRUE;
+            return DxgkpPointerBridgeSetPosition(Adapter, VidPnSourceId);
+
+        case IOCTL_VIDEO_DISABLE_POINTER:
+            if (!Hardware || !Pointer->Visible)
+                return STATUS_SUCCESS;
+            Pointer->Visible = FALSE;
+            return DxgkpPointerBridgeSetPosition(Adapter, VidPnSourceId);
+
+        case IOCTL_VIDEO_SET_POINTER_ATTR:
+            if (!Hardware)
+                return STATUS_NOT_SUPPORTED;
+            if (Buffer == NULL || InputLength < FIELD_OFFSET(VIDEO_POINTER_ATTRIBUTES, Pixels))
+                return STATUS_BUFFER_TOO_SMALL;
+            return DxgkpPointerBridgeSetShape(Adapter, VidPnSourceId, (PVIDEO_POINTER_ATTRIBUTES)Buffer, InputLength);
+
+        case IOCTL_VIDEO_SET_POINTER_POSITION:
+        {
+            PVIDEO_POINTER_POSITION Position = (PVIDEO_POINTER_POSITION)Buffer;
+
+            if (!Hardware)
+                return STATUS_SUCCESS;
+            if (Position == NULL || InputLength < sizeof(VIDEO_POINTER_POSITION))
+                return STATUS_BUFFER_TOO_SMALL;
+            Pointer->X = Position->Column;
+            Pointer->Y = Position->Row;
+            return DxgkpPointerBridgeSetPosition(Adapter, VidPnSourceId);
+        }
+
+        case IOCTL_VIDEO_QUERY_POINTER_POSITION:
+        {
+            PVIDEO_POINTER_POSITION Position = (PVIDEO_POINTER_POSITION)Buffer;
+
+            if (!Hardware || Position == NULL || OutputLength < sizeof(VIDEO_POINTER_POSITION))
+                return STATUS_NOT_SUPPORTED;
+            Position->Column = (SHORT)Pointer->X;
+            Position->Row = (SHORT)Pointer->Y;
+            *BytesReturned = sizeof(VIDEO_POINTER_POSITION);
+            return STATUS_SUCCESS;
+        }
+
+        case IOCTL_VIDEO_QUERY_POINTER_CAPABILITIES:
+        {
+            PVIDEO_POINTER_CAPABILITIES Caps = (PVIDEO_POINTER_CAPABILITIES)Buffer;
+
+            if (!Hardware)
+            {
+                DXGKRNL_TRACE("DxgkpPointerControl: IOCTL_VIDEO_QUERY_POINTER_CAPABILITIES: no hardware pointer\n");
+                return STATUS_NOT_SUPPORTED;
+            }
+            if (Caps == NULL || OutputLength < sizeof(VIDEO_POINTER_CAPABILITIES))
+                return STATUS_BUFFER_TOO_SMALL;
+            RtlZeroMemory(Caps, sizeof(*Caps));
+            Caps->Flags = VIDEO_MODE_ASYNC_POINTER | VIDEO_MODE_COLOR_POINTER;
+            Caps->MaxWidth = Adapter->PointerMaxWidth;
+            Caps->MaxHeight = Adapter->PointerMaxHeight;
+            Caps->HWPtrBitmapStart = (ULONG)-1;
+            Caps->HWPtrBitmapEnd = (ULONG)-1;
+            *BytesReturned = sizeof(VIDEO_POINTER_CAPABILITIES);
+            return STATUS_SUCCESS;
+        }
+
+        default:
+            ASSERT(FALSE);
+            return STATUS_NOT_SUPPORTED;
+    }
 }
 
 /* DISPLAY_DEVICE.StateFlags of a monitor (wingdi.h DISPLAY_DEVICE_ACTIVE, DISPLAY_DEVICE_ATTACHED). */
@@ -4303,6 +4410,7 @@ DxgkpPointerBridgeSetShape(
 static NTSTATUS
 DxgkpEnumMonitorPdos(
     _In_opt_ PDXGKRNL_ADAPTER Adapter,
+    _In_ D3DDDI_VIDEO_PRESENT_SOURCE_ID VidPnSourceId,
     _Outptr_ PVIDEO_MONITOR_DEVICE *Monitors)
 {
     D3DDDI_VIDEO_PRESENT_TARGET_ID Targets[DXGKP_MAX_PATHS];
@@ -4329,9 +4437,12 @@ DxgkpEnumMonitorPdos(
     if (hVidPn != NULL)
     {
         VidPn = (PDXGKP_VIDPN)hVidPn;
+        /* The desktop display device names the source of the first path */
+        if (VidPnSourceId == D3DDDI_ID_UNINITIALIZED && VidPn->NumPaths != 0)
+            VidPnSourceId = VidPn->Paths[0].VidPnSourceId;
         for (PathIndex = 0; PathIndex < VidPn->NumPaths && TargetCount < RTL_NUMBER_OF(Targets); PathIndex++)
         {
-            if (VidPn->Paths[PathIndex].VidPnSourceId == VidPn->Paths[0].VidPnSourceId)
+            if (VidPn->Paths[PathIndex].VidPnSourceId == VidPnSourceId)
                 Targets[TargetCount++] = VidPn->Paths[PathIndex].VidPnTargetId;
         }
         DxgkVidPnDestroy(hVidPn);
@@ -4461,7 +4572,7 @@ DxgkpDisplayDispatch(
             {
                 PVIDEO_MONITOR_DEVICE MonArray;
 
-                Status = DxgkpEnumMonitorPdos(g_DisplayAdapter, &MonArray);
+                Status = DxgkpEnumMonitorPdos(g_DisplayAdapter, D3DDDI_ID_UNINITIALIZED, &MonArray);
                 if (NT_SUCCESS(Status))
                 {
                     *(PVIDEO_MONITOR_DEVICE *)Irp->AssociatedIrp.SystemBuffer = MonArray;
@@ -5195,148 +5306,23 @@ DxgkpDisplayDispatch(
             break;
         }
 
-        /*
-         * Pointer/cursor IOCTLs.
-         *
-         * Bridged to the miniport's DxgkDdiSetPointerShape/Position when it
-         * advertises a color hardware pointer (see DxgkpPointerBridge* above).
-         * Otherwise QUERY_POINTER_CAPABILITIES / SET_POINTER_ATTR fail and
-         * win32ss falls back to GDI software cursor rendering.
-         */
+        /* Bridged to the miniport's DxgkDdiSetPointerShape/Position when it advertises a color hardware pointer */
         case IOCTL_VIDEO_ENABLE_POINTER:
-        {
-            DXGKRNL_TRACE("DxgkpDisplayDispatch: IOCTL_VIDEO_ENABLE_POINTER\n");
-            Status = STATUS_SUCCESS;
-            if (g_DisplayAdapter != NULL &&
-                DxgkpPointerBridgeSupported(g_DisplayAdapter) &&
-                g_DisplayAdapter->PointerShapeValid)
-            {
-                g_DisplayAdapter->PointerVisible = TRUE;
-                Status = DxgkpPointerBridgeSetPosition(g_DisplayAdapter);
-            }
-            break;
-        }
-
         case IOCTL_VIDEO_DISABLE_POINTER:
-        {
-            DXGKRNL_TRACE("DxgkpDisplayDispatch: IOCTL_VIDEO_DISABLE_POINTER\n");
-            Status = STATUS_SUCCESS;
-            if (g_DisplayAdapter != NULL &&
-                DxgkpPointerBridgeSupported(g_DisplayAdapter) &&
-                g_DisplayAdapter->PointerVisible)
-            {
-                g_DisplayAdapter->PointerVisible = FALSE;
-                Status = DxgkpPointerBridgeSetPosition(g_DisplayAdapter);
-            }
-            break;
-        }
-
         case IOCTL_VIDEO_SET_POINTER_ATTR:
-        {
-            PVIDEO_POINTER_ATTRIBUTES Attributes =
-                (PVIDEO_POINTER_ATTRIBUTES)Irp->AssociatedIrp.SystemBuffer;
-            ULONG InputLength =
-                Stack->Parameters.DeviceIoControl.InputBufferLength;
-
-            if (g_DisplayAdapter == NULL ||
-                !DxgkpPointerBridgeSupported(g_DisplayAdapter))
-            {
-                Status = STATUS_NOT_SUPPORTED;
-                break;
-            }
-
-            if (Attributes == NULL ||
-                InputLength < FIELD_OFFSET(VIDEO_POINTER_ATTRIBUTES, Pixels))
-            {
-                Status = STATUS_BUFFER_TOO_SMALL;
-                break;
-            }
-
-            Status = DxgkpPointerBridgeSetShape(g_DisplayAdapter,
-                                                Attributes,
-                                                InputLength);
-            break;
-        }
-
         case IOCTL_VIDEO_SET_POINTER_POSITION:
-        {
-            PVIDEO_POINTER_POSITION Position =
-                (PVIDEO_POINTER_POSITION)Irp->AssociatedIrp.SystemBuffer;
-
-            if (g_DisplayAdapter == NULL ||
-                !DxgkpPointerBridgeSupported(g_DisplayAdapter))
-            {
-                Status = STATUS_SUCCESS;
-                break;
-            }
-
-            if (Position == NULL ||
-                Stack->Parameters.DeviceIoControl.InputBufferLength <
-                    sizeof(VIDEO_POINTER_POSITION))
-            {
-                Status = STATUS_BUFFER_TOO_SMALL;
-                break;
-            }
-
-            g_DisplayAdapter->PointerX = Position->Column;
-            g_DisplayAdapter->PointerY = Position->Row;
-            Status = DxgkpPointerBridgeSetPosition(g_DisplayAdapter);
-            break;
-        }
-
         case IOCTL_VIDEO_QUERY_POINTER_POSITION:
-        {
-            PVIDEO_POINTER_POSITION Position =
-                (PVIDEO_POINTER_POSITION)Irp->AssociatedIrp.SystemBuffer;
-
-            if (g_DisplayAdapter == NULL ||
-                !DxgkpPointerBridgeSupported(g_DisplayAdapter) ||
-                Position == NULL ||
-                Stack->Parameters.DeviceIoControl.OutputBufferLength <
-                    sizeof(VIDEO_POINTER_POSITION))
-            {
-                Status = STATUS_NOT_SUPPORTED;
-                break;
-            }
-
-            Position->Column = (SHORT)g_DisplayAdapter->PointerX;
-            Position->Row = (SHORT)g_DisplayAdapter->PointerY;
-            BytesReturned = sizeof(VIDEO_POINTER_POSITION);
-            Status = STATUS_SUCCESS;
-            break;
-        }
-
         case IOCTL_VIDEO_QUERY_POINTER_CAPABILITIES:
         {
-            PVIDEO_POINTER_CAPABILITIES Caps =
-                (PVIDEO_POINTER_CAPABILITIES)Irp->AssociatedIrp.SystemBuffer;
+            ULONG_PTR PointerBytes;
 
-            if (g_DisplayAdapter == NULL ||
-                !DxgkpPointerBridgeSupported(g_DisplayAdapter))
-            {
-                DXGKRNL_TRACE("DxgkpDisplayDispatch: "
-                              "IOCTL_VIDEO_QUERY_POINTER_CAPABILITIES: "
-                              "no hardware pointer\n");
-                Status = STATUS_NOT_SUPPORTED;
-                break;
-            }
-
-            if (Caps == NULL ||
-                Stack->Parameters.DeviceIoControl.OutputBufferLength <
-                    sizeof(VIDEO_POINTER_CAPABILITIES))
-            {
-                Status = STATUS_BUFFER_TOO_SMALL;
-                break;
-            }
-
-            RtlZeroMemory(Caps, sizeof(*Caps));
-            Caps->Flags = VIDEO_MODE_ASYNC_POINTER | VIDEO_MODE_COLOR_POINTER;
-            Caps->MaxWidth = g_DisplayAdapter->PointerMaxWidth;
-            Caps->MaxHeight = g_DisplayAdapter->PointerMaxHeight;
-            Caps->HWPtrBitmapStart = (ULONG)-1;
-            Caps->HWPtrBitmapEnd = (ULONG)-1;
-            BytesReturned = sizeof(VIDEO_POINTER_CAPABILITIES);
-            Status = STATUS_SUCCESS;
+            Status = DxgkpPointerControl(g_DisplayAdapter, 0,
+                                         Stack->Parameters.DeviceIoControl.IoControlCode,
+                                         Irp->AssociatedIrp.SystemBuffer,
+                                         Stack->Parameters.DeviceIoControl.InputBufferLength,
+                                         Stack->Parameters.DeviceIoControl.OutputBufferLength,
+                                         &PointerBytes);
+            BytesReturned = (ULONG)PointerBytes;
             break;
         }
 
@@ -5499,6 +5485,752 @@ DxgkpDisplayCreateVideoDevice(
     _Out_ PULONG Number,
     _Out_writes_(DeviceBufferCount) PWCHAR DeviceBuffer,
     _In_ SIZE_T DeviceBufferCount);
+
+/* ========================================================================
+ * Display devices of the further VidPN sources
+ *
+ * Windows has one display device per VidPN source. Each further source of
+ * a full WDDM adapter gets a \Device\VideoN of its own, so win32k can
+ * enable a PDEV on it while the source scans out (an extended desktop).
+ * The device objects stay for the life of the driver; unregistering
+ * detaches them from the adapter and withdraws their DEVICEMAP entries.
+ * ====================================================================== */
+
+#define DXGKP_SOURCE_DISPLAY_SIGNATURE 0x70536744 /* 'DgSp' */
+#define DXGKP_SOURCE_DISPLAY_MAPPINGS  4
+
+typedef struct _DXGKP_SOURCE_DISPLAY_MAPPING
+{
+    PVOID Va;
+    ULONG Size;
+} DXGKP_SOURCE_DISPLAY_MAPPING;
+
+typedef struct _DXGKP_SOURCE_DISPLAY
+{
+    ULONG Signature;
+    D3DDDI_VIDEO_PRESENT_SOURCE_ID VidPnSourceId;
+    ULONG DeviceNumber;
+    BOOLEAN Published;
+    /* Guards every field below; held across each request */
+    KMUTEX Mutex;
+    PDXGKRNL_ADAPTER Adapter;
+    DXGKP_SOURCE_DISPLAY_MAPPING Mappings[DXGKP_SOURCE_DISPLAY_MAPPINGS];
+} DXGKP_SOURCE_DISPLAY, *PDXGKP_SOURCE_DISPLAY;
+
+/* Slots are filled once and never emptied; claims, publication and withdrawal run under the table mutex,
+ * which is taken before a display's own mutex */
+static PDEVICE_OBJECT g_SourceDisplayDevices[DXGKRNL_MAX_SOURCE_PRIMARIES];
+static KMUTEX g_SourceDisplayTableMutex;
+
+VOID
+DxgkDisplayInitializeGlobals(VOID)
+{
+    KeInitializeMutex(&g_SourceDisplayTableMutex, 0);
+}
+
+static PDXGKP_SOURCE_DISPLAY
+DxgkpSourceDisplayFromDevice(
+    _In_opt_ PDEVICE_OBJECT DeviceObject)
+{
+    PDXGKP_SOURCE_DISPLAY Display;
+    ULONG Index;
+
+    if (DeviceObject == NULL || DeviceObject == g_DisplayDeviceObject)
+        return NULL;
+    for (Index = 0; Index < RTL_NUMBER_OF(g_SourceDisplayDevices); Index++)
+    {
+        if (ReadPointerAcquire((PVOID *)&g_SourceDisplayDevices[Index]) != DeviceObject)
+            continue;
+        Display = (PDXGKP_SOURCE_DISPLAY)DeviceObject->DeviceExtension;
+        ASSERT(Display->Signature == DXGKP_SOURCE_DISPLAY_SIGNATURE);
+        return Display;
+    }
+    return NULL;
+}
+
+static VOID
+DxgkpFillSourceDisplayMode(
+    _Out_ PVIDEO_MODE_INFORMATION ModeInfo,
+    _In_ ULONG Width,
+    _In_ ULONG Height)
+{
+    RtlZeroMemory(ModeInfo, sizeof(*ModeInfo));
+    ModeInfo->Length = sizeof(*ModeInfo);
+    ModeInfo->ModeIndex = 0;
+    ModeInfo->VisScreenWidth = Width;
+    ModeInfo->VisScreenHeight = Height;
+    ModeInfo->ScreenStride = Width * 4;
+    ModeInfo->NumberOfPlanes = 1;
+    ModeInfo->BitsPerPlane = 32;
+    /* TODO: the refresh rate of the pinned target mode */
+    ModeInfo->Frequency = 60;
+    ModeInfo->XMillimeter = 320;
+    ModeInfo->YMillimeter = 240;
+    ModeInfo->NumberRedBits = 8;
+    ModeInfo->NumberGreenBits = 8;
+    ModeInfo->NumberBlueBits = 8;
+    ModeInfo->RedMask = 0x00FF0000;
+    ModeInfo->GreenMask = 0x0000FF00;
+    ModeInfo->BlueMask = 0x000000FF;
+    ModeInfo->AttributeFlags = VIDEO_MODE_COLOR | VIDEO_MODE_GRAPHICS;
+    ModeInfo->VideoMemoryBitmapWidth = Width;
+    ModeInfo->VideoMemoryBitmapHeight = Height;
+    ModeInfo->DriverSpecificAttributeFlags = DXGK_DISP_DRIVERSPEC_SYSMEM_FB;
+}
+
+static NTSTATUS
+DxgkpSourceDisplayMap(
+    _Inout_ PDXGKP_SOURCE_DISPLAY Display,
+    _In_ ULONG Width,
+    _In_ ULONG Height,
+    _Out_ PVIDEO_MEMORY_INFORMATION MemoryInfo)
+{
+    ULONG Index;
+    ULONG Size;
+    PVOID Va;
+
+    ASSERT(Width != 0);
+    ASSERT(Height != 0);
+    if (Width > MAXULONG / 4 / Height)
+        return STATUS_INVALID_PARAMETER;
+    Size = Width * Height * 4;
+    for (Index = 0; Index < RTL_NUMBER_OF(Display->Mappings); Index++)
+    {
+        if (Display->Mappings[Index].Va == NULL)
+            break;
+    }
+    if (Index == RTL_NUMBER_OF(Display->Mappings))
+        return STATUS_TOO_MANY_OPENED_FILES;
+    Va = ExAllocatePoolZero(NonPagedPool, Size, TAG_DXGK_DISPLAY);
+    if (Va == NULL)
+        return STATUS_INSUFFICIENT_RESOURCES;
+    Display->Mappings[Index].Va = Va;
+    Display->Mappings[Index].Size = Size;
+    MemoryInfo->VideoRamBase = Va;
+    MemoryInfo->VideoRamLength = Size;
+    MemoryInfo->FrameBufferBase = Va;
+    MemoryInfo->FrameBufferLength = Size;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+DxgkpSourceDisplayUnmap(
+    _Inout_ PDXGKP_SOURCE_DISPLAY Display,
+    _In_opt_ PVOID Va)
+{
+    ULONG Index;
+
+    for (Index = 0; Va != NULL && Index < RTL_NUMBER_OF(Display->Mappings); Index++)
+    {
+        if (Display->Mappings[Index].Va != Va)
+            continue;
+        ExFreePoolWithTag(Va, TAG_DXGK_DISPLAY);
+        Display->Mappings[Index].Va = NULL;
+        Display->Mappings[Index].Size = 0;
+        return STATUS_SUCCESS;
+    }
+    return STATUS_INVALID_PARAMETER;
+}
+
+static NTSTATUS
+DxgkpSourceDisplayCheckDirtyRects(
+    _In_ KPROCESSOR_MODE RequestorMode,
+    _In_opt_ PVOID Buffer,
+    _In_ ULONG InputLength)
+{
+    PDXGK_PRESENT_DIRTY_RECTS_INPUT Input = (PDXGK_PRESENT_DIRTY_RECTS_INPUT)Buffer;
+    SIZE_T HeaderSize = FIELD_OFFSET(DXGK_PRESENT_DIRTY_RECTS_INPUT, Rects);
+
+    if (RequestorMode != KernelMode)
+        return STATUS_ACCESS_DENIED;
+    if (Input == NULL || InputLength < HeaderSize)
+        return STATUS_BUFFER_TOO_SMALL;
+    if (Input->RectCount > DXGK_PRESENT_DIRTY_MAX_RECTS)
+        return STATUS_NOT_SUPPORTED;
+    if (Input->StructSize != HeaderSize + Input->RectCount * sizeof(Input->Rects[0]) ||
+        InputLength != Input->StructSize ||
+        (Input->Flags & ~DXGK_PRESENT_DIRTY_FLUSH) != 0)
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (Input->Source == 0 || Input->SourcePitch == 0 || Input->SourceSize == 0 ||
+        Input->Source < (ULONG_PTR)MmSystemRangeStart)
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+DxgkpSourceDisplayControl(
+    _Inout_ PDXGKP_SOURCE_DISPLAY Display,
+    _In_ ULONG IoControlCode,
+    _In_ KPROCESSOR_MODE RequestorMode,
+    _Inout_opt_ PVOID Buffer,
+    _In_ ULONG InputLength,
+    _In_ ULONG OutputLength,
+    _Out_ PULONG_PTR BytesReturned)
+{
+    PDXGKRNL_ADAPTER Adapter = Display->Adapter;
+    PVIDEO_MONITOR_DEVICE Monitors;
+    ULONG Width;
+    ULONG Height;
+    BOOLEAN Live;
+    NTSTATUS Status;
+
+    ASSERT(Adapter != NULL);
+    *BytesReturned = 0;
+    Live = DxgkVidPnGetSourcePrimarySize(Adapter, Display->VidPnSourceId, &Width, &Height);
+    switch (IoControlCode)
+    {
+        case IOCTL_VIDEO_INIT_WIN32K_CALLBACKS:
+        {
+            PVIDEO_WIN32K_CALLBACKS Callbacks = (PVIDEO_WIN32K_CALLBACKS)Buffer;
+
+            if (Callbacks == NULL || InputLength < sizeof(*Callbacks) || OutputLength < sizeof(*Callbacks))
+                return STATUS_BUFFER_TOO_SMALL;
+            /* The desktop display device carries the session's callout */
+            Callbacks->pPhysDeviceObject = Adapter->PhysicalDeviceObject;
+            Callbacks->bACPI = FALSE;
+            Callbacks->DualviewFlags = 0;
+            *BytesReturned = sizeof(*Callbacks);
+            return STATUS_SUCCESS;
+        }
+
+        case IOCTL_VIDEO_ENUM_MONITOR_PDO:
+            if (Buffer == NULL || OutputLength < sizeof(PVOID))
+                return STATUS_BUFFER_TOO_SMALL;
+            Status = DxgkpEnumMonitorPdos(Adapter, Display->VidPnSourceId, &Monitors);
+            if (!NT_SUCCESS(Status))
+                return Status;
+            *(PVIDEO_MONITOR_DEVICE *)Buffer = Monitors;
+            *BytesReturned = sizeof(PVOID);
+            return STATUS_SUCCESS;
+
+        case IOCTL_VIDEO_QUERY_NUM_AVAIL_MODES:
+        {
+            PVIDEO_NUM_MODES NumModes = (PVIDEO_NUM_MODES)Buffer;
+
+            if (NumModes == NULL || OutputLength < sizeof(*NumModes))
+                return STATUS_BUFFER_TOO_SMALL;
+            /* TODO: the other source modes of the path; a further source offers its pinned mode */
+            NumModes->NumModes = Live ? 1 : 0;
+            NumModes->ModeInformationLength = sizeof(VIDEO_MODE_INFORMATION);
+            *BytesReturned = sizeof(*NumModes);
+            return STATUS_SUCCESS;
+        }
+
+        case IOCTL_VIDEO_QUERY_AVAIL_MODES:
+        case IOCTL_VIDEO_QUERY_CURRENT_MODE:
+            if (Buffer == NULL || OutputLength < sizeof(VIDEO_MODE_INFORMATION))
+                return STATUS_BUFFER_TOO_SMALL;
+            if (!Live)
+                return IoControlCode == IOCTL_VIDEO_QUERY_AVAIL_MODES ? STATUS_SUCCESS : STATUS_DEVICE_NOT_READY;
+            DxgkpFillSourceDisplayMode((PVIDEO_MODE_INFORMATION)Buffer, Width, Height);
+            *BytesReturned = sizeof(VIDEO_MODE_INFORMATION);
+            return STATUS_SUCCESS;
+
+        case IOCTL_VIDEO_SET_CURRENT_MODE:
+        {
+            PVIDEO_MODE Mode = (PVIDEO_MODE)Buffer;
+
+            if (Mode == NULL || InputLength < sizeof(*Mode))
+                return STATUS_BUFFER_TOO_SMALL;
+            if (!Live)
+                return STATUS_DEVICE_NOT_READY;
+            /* TODO: a mode change on a further source commits a VidPN; only its current mode is accepted */
+            if ((Mode->RequestedMode & ~(VIDEO_MODE_NO_ZERO_MEMORY | VIDEO_MODE_MAP_MEM_LINEAR)) != 0)
+                return STATUS_INVALID_PARAMETER;
+            return STATUS_SUCCESS;
+        }
+
+        case IOCTL_VIDEO_MAP_VIDEO_MEMORY:
+            if (Buffer == NULL || InputLength < sizeof(VIDEO_MEMORY) || OutputLength < sizeof(VIDEO_MEMORY_INFORMATION))
+                return STATUS_BUFFER_TOO_SMALL;
+            if (!Live)
+                return STATUS_DEVICE_NOT_READY;
+            Status = DxgkpSourceDisplayMap(Display, Width, Height, (PVIDEO_MEMORY_INFORMATION)Buffer);
+            if (NT_SUCCESS(Status))
+                *BytesReturned = sizeof(VIDEO_MEMORY_INFORMATION);
+            return Status;
+
+        case IOCTL_VIDEO_UNMAP_VIDEO_MEMORY:
+            if (Buffer == NULL || InputLength < sizeof(VIDEO_MEMORY))
+                return STATUS_BUFFER_TOO_SMALL;
+            return DxgkpSourceDisplayUnmap(Display, ((PVIDEO_MEMORY)Buffer)->RequestedVirtualAddress);
+
+        case IOCTL_VIDEO_DXGK_PRESENT_DIRTY_RECT:
+        {
+            PDXGK_PRESENT_DIRTY_RECTS_INPUT Input = (PDXGK_PRESENT_DIRTY_RECTS_INPUT)Buffer;
+
+            Status = DxgkpSourceDisplayCheckDirtyRects(RequestorMode, Buffer, InputLength);
+            if (!NT_SUCCESS(Status))
+                return Status;
+            if (!Live)
+                return STATUS_DEVICE_NOT_READY;
+            /* The desktop source of an adapter that does not host the desktop scans out what GDI drew, as the bridge does */
+            if (!DxgkIsDisplayAdapter(Adapter) && Display->VidPnSourceId == 0)
+            {
+                if ((Input->Flags & DXGK_PRESENT_DIRTY_FLUSH) == 0)
+                    return STATUS_SUCCESS;
+                return DxgkpPresentSourceRects(Adapter, (PVOID)Input->Source, Input->SourcePitch, Input->SourceSize,
+                                               Input->Rects, Input->RectCount, "source");
+            }
+            /* FIXME: GDI drawing on a further source reaches its screen only through the compositor */
+            return STATUS_SUCCESS;
+        }
+
+        case IOCTL_VIDEO_RESET_DEVICE:
+            return STATUS_SUCCESS;
+
+        case IOCTL_VIDEO_ENABLE_POINTER:
+        case IOCTL_VIDEO_DISABLE_POINTER:
+        case IOCTL_VIDEO_SET_POINTER_ATTR:
+        case IOCTL_VIDEO_SET_POINTER_POSITION:
+        case IOCTL_VIDEO_QUERY_POINTER_POSITION:
+        case IOCTL_VIDEO_QUERY_POINTER_CAPABILITIES:
+            return DxgkpPointerControl(Adapter, Display->VidPnSourceId, IoControlCode, Buffer, InputLength, OutputLength,
+                                       BytesReturned);
+
+        default:
+            return STATUS_NOT_SUPPORTED;
+    }
+}
+
+static NTSTATUS
+DxgkpSourceDisplayDispatch(
+    _In_ PDXGKP_SOURCE_DISPLAY Display,
+    _In_ PIRP Irp)
+{
+    PIO_STACK_LOCATION Stack = IoGetCurrentIrpStackLocation(Irp);
+    ULONG_PTR BytesReturned = 0;
+    NTSTATUS Status;
+
+    PAGED_CODE();
+    (VOID)KeWaitForSingleObject(&Display->Mutex, Executive, KernelMode, FALSE, NULL);
+    if (Display->Adapter == NULL &&
+        Stack->Parameters.DeviceIoControl.IoControlCode == IOCTL_VIDEO_UNMAP_VIDEO_MEMORY)
+    {
+        /* A display driver still unmaps what it mapped before the adapter went away */
+        Status = Irp->AssociatedIrp.SystemBuffer == NULL ||
+                 Stack->Parameters.DeviceIoControl.InputBufferLength < sizeof(VIDEO_MEMORY) ?
+                 STATUS_BUFFER_TOO_SMALL :
+                 DxgkpSourceDisplayUnmap(Display, ((PVIDEO_MEMORY)Irp->AssociatedIrp.SystemBuffer)->RequestedVirtualAddress);
+    }
+    else if (Display->Adapter == NULL)
+    {
+        Status = STATUS_DEVICE_REMOVED;
+    }
+    else
+    {
+        Status = DxgkpSourceDisplayControl(Display,
+                                           Stack->Parameters.DeviceIoControl.IoControlCode,
+                                           Irp->RequestorMode,
+                                           Irp->AssociatedIrp.SystemBuffer,
+                                           Stack->Parameters.DeviceIoControl.InputBufferLength,
+                                           Stack->Parameters.DeviceIoControl.OutputBufferLength,
+                                           &BytesReturned);
+    }
+    KeReleaseMutex(&Display->Mutex, FALSE);
+    ASSERT(NT_SUCCESS(Status) || BytesReturned == 0);
+    Irp->IoStatus.Status = Status;
+    Irp->IoStatus.Information = BytesReturned;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    return Status;
+}
+
+static NTSTATUS
+DxgkpSourceDisplayPnp(
+    _In_ PDXGKP_SOURCE_DISPLAY Display,
+    _In_ PIRP Irp)
+{
+    PIO_STACK_LOCATION Stack = IoGetCurrentIrpStackLocation(Irp);
+    PDEVICE_RELATIONS Relations;
+    NTSTATUS Status = STATUS_SUCCESS;
+
+    PAGED_CODE();
+    Irp->IoStatus.Information = 0;
+    if (Stack->MinorFunction == IRP_MN_QUERY_DEVICE_RELATIONS)
+    {
+        if (Stack->Parameters.QueryDeviceRelations.Type != TargetDeviceRelation)
+        {
+            Status = Irp->IoStatus.Status;
+        }
+        else
+        {
+            (VOID)KeWaitForSingleObject(&Display->Mutex, Executive, KernelMode, FALSE, NULL);
+            if (Display->Adapter == NULL || Display->Adapter->PhysicalDeviceObject == NULL)
+            {
+                Status = STATUS_DEVICE_NOT_CONNECTED;
+            }
+            else
+            {
+                Relations = ExAllocatePoolWithTag(PagedPool, sizeof(*Relations), TAG_DXGK_DISPLAY);
+                if (Relations == NULL)
+                {
+                    Status = STATUS_INSUFFICIENT_RESOURCES;
+                }
+                else
+                {
+                    Relations->Count = 1;
+                    Relations->Objects[0] = Display->Adapter->PhysicalDeviceObject;
+                    ObReferenceObject(Relations->Objects[0]);
+                    Irp->IoStatus.Information = (ULONG_PTR)Relations;
+                }
+            }
+            KeReleaseMutex(&Display->Mutex, FALSE);
+        }
+    }
+    Irp->IoStatus.Status = Status;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    return Status;
+}
+
+static NTSTATUS
+DxgkpSourceDisplayCreateDevice(
+    _In_ D3DDDI_VIDEO_PRESENT_SOURCE_ID VidPnSourceId,
+    _Out_ PDEVICE_OBJECT *DeviceObject)
+{
+    PDXGKP_SOURCE_DISPLAY Display;
+    UNICODE_STRING DeviceName;
+    WCHAR DeviceBuffer[24];
+    ULONG DeviceNumber;
+    NTSTATUS Status = STATUS_OBJECT_NAME_COLLISION;
+
+    *DeviceObject = NULL;
+    for (DeviceNumber = 0; DeviceNumber < 16 && Status == STATUS_OBJECT_NAME_COLLISION; DeviceNumber++)
+    {
+        RtlStringCchPrintfW(DeviceBuffer, RTL_NUMBER_OF(DeviceBuffer), L"\\Device\\Video%lu", DeviceNumber);
+        RtlInitUnicodeString(&DeviceName, DeviceBuffer);
+        Status = IoCreateDevice(GDxgControlDeviceObject->DriverObject, sizeof(DXGKP_SOURCE_DISPLAY), &DeviceName,
+                                FILE_DEVICE_VIDEO, FILE_DEVICE_SECURE_OPEN, FALSE, DeviceObject);
+        if (NT_SUCCESS(Status))
+            break;
+    }
+    if (!NT_SUCCESS(Status))
+        return Status;
+
+    Display = (PDXGKP_SOURCE_DISPLAY)(*DeviceObject)->DeviceExtension;
+    RtlZeroMemory(Display, sizeof(*Display));
+    Display->Signature = DXGKP_SOURCE_DISPLAY_SIGNATURE;
+    Display->VidPnSourceId = VidPnSourceId;
+    Display->DeviceNumber = DeviceNumber;
+    KeInitializeMutex(&Display->Mutex, 0);
+    (*DeviceObject)->Flags |= DO_BUFFERED_IO;
+    (*DeviceObject)->Flags &= ~DO_DEVICE_INITIALIZING;
+    return STATUS_SUCCESS;
+}
+
+/* The settings key win32k reads for the device, then its DEVICEMAP entry */
+static NTSTATUS
+DxgkpSourceDisplayCreateSettingsKey(
+    _In_ PDXGKRNL_ADAPTER Adapter,
+    _In_ D3DDDI_VIDEO_PRESENT_SOURCE_ID SourceId,
+    _In_ ULONG DeviceNumber,
+    _Out_writes_(DriverKeyCount) PWCHAR DriverKey,
+    _In_ SIZE_T DriverKeyCount,
+    _Out_ PHANDLE KeyHandle,
+    _Out_ PULONG Disposition)
+{
+    OBJECT_ATTRIBUTES ObjectAttributes;
+    UNICODE_STRING KeyName;
+    HANDLE hParentKey;
+    NTSTATUS Status;
+
+    PAGED_CODE();
+    *KeyHandle = NULL;
+    *Disposition = REG_CREATED_NEW_KEY;
+    /* The settings of a display persist under its adapter's software key, so a restart keeps its place on the desktop */
+    if (Adapter->DeviceRegistryPath.Buffer != NULL &&
+        NT_SUCCESS(RtlStringCchPrintfW(DriverKey, DriverKeyCount, L"%wZ\\Display", &Adapter->DeviceRegistryPath)))
+    {
+        RtlInitUnicodeString(&KeyName, DriverKey);
+        InitializeObjectAttributes(&ObjectAttributes, &KeyName, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+        Status = ZwCreateKey(&hParentKey, KEY_ALL_ACCESS, &ObjectAttributes, 0, NULL, REG_OPTION_NON_VOLATILE, NULL);
+        if (NT_SUCCESS(Status))
+        {
+            ZwClose(hParentKey);
+            Status = RtlStringCchPrintfW(DriverKey, DriverKeyCount, L"%wZ\\Display\\%04u", &Adapter->DeviceRegistryPath, SourceId);
+        }
+        if (NT_SUCCESS(Status))
+        {
+            RtlInitUnicodeString(&KeyName, DriverKey);
+            Status = ZwCreateKey(KeyHandle, KEY_ALL_ACCESS, &ObjectAttributes, 0, NULL, REG_OPTION_NON_VOLATILE, Disposition);
+        }
+        if (NT_SUCCESS(Status))
+            return Status;
+        DXGKRNL_WARN("DxgkpSourceDisplayCreateSettingsKey: adapter %p source %u settings stay volatile (0x%08lX)\n",
+                     Adapter, SourceId, Status);
+    }
+
+    Status = RtlStringCchPrintfW(DriverKey, DriverKeyCount,
+                                 L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Services\\dxgkrnl\\Device%lu", DeviceNumber);
+    if (!NT_SUCCESS(Status))
+        return Status;
+    RtlInitUnicodeString(&KeyName, DriverKey);
+    InitializeObjectAttributes(&ObjectAttributes, &KeyName, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+    return ZwCreateKey(KeyHandle, KEY_ALL_ACCESS, &ObjectAttributes, 0, NULL, REG_OPTION_VOLATILE, Disposition);
+}
+
+static NTSTATUS
+DxgkpSourceDisplayPublish(
+    _In_ PDXGKRNL_ADAPTER Adapter,
+    _In_ D3DDDI_VIDEO_PRESENT_SOURCE_ID SourceId,
+    _In_ ULONG DeviceNumber)
+{
+    WCHAR DriverKey[256];
+    WCHAR DeviceValueName[24];
+    WCHAR Description[128] = { 0 };
+    ULONG DescriptionLength;
+    ULONG MaxObjectNumber;
+    ULONG Disposition;
+    HANDLE hDriverKey;
+    NTSTATUS Status;
+
+    PAGED_CODE();
+    Status = DxgkpSourceDisplayCreateSettingsKey(Adapter, SourceId, DeviceNumber, DriverKey, RTL_NUMBER_OF(DriverKey),
+                                                 &hDriverKey, &Disposition);
+    if (!NT_SUCCESS(Status))
+        return Status;
+    Status = DxgkpRegWriteDisplayDrivers(hDriverKey, DxgkpSelectDisplayDriver(Adapter));
+    if (Adapter->PhysicalDeviceObject == NULL ||
+        !NT_SUCCESS(IoGetDeviceProperty(Adapter->PhysicalDeviceObject, DevicePropertyDeviceDescription,
+                                        sizeof(Description) - sizeof(WCHAR), Description, &DescriptionLength)) ||
+        Description[0] == UNICODE_NULL)
+    {
+        (VOID)RtlStringCchCopyW(Description, RTL_NUMBER_OF(Description), L"WDDM Display Adapter (dxgkrnl/cdd)");
+    }
+    (VOID)DxgkpRegWriteString(hDriverKey, L"Device Description", Description);
+    /* A display device that was never attached to the desktop is registered in the detached mode */
+    if (Disposition == REG_CREATED_NEW_KEY)
+    {
+        (VOID)DxgkpRegWriteDword(hDriverKey, L"DefaultSettings.XResolution", 0);
+        (VOID)DxgkpRegWriteDword(hDriverKey, L"DefaultSettings.YResolution", 0);
+        (VOID)DxgkpRegWriteDword(hDriverKey, L"DefaultSettings.BitsPerPel", 32);
+        (VOID)DxgkpRegWriteDword(hDriverKey, L"DefaultSettings.VRefresh", 60);
+        (VOID)DxgkpRegWriteDword(hDriverKey, L"DefaultSettings.Flags", 0);
+        (VOID)DxgkpRegWriteDword(hDriverKey, L"DefaultSettings.XPanning", 0);
+        (VOID)DxgkpRegWriteDword(hDriverKey, L"DefaultSettings.YPanning", 0);
+        (VOID)DxgkpRegWriteDword(hDriverKey, L"DefaultSettings.Orientation", 0);
+        (VOID)DxgkpRegWriteDword(hDriverKey, L"DefaultSettings.FixedOutput", 0);
+        (VOID)DxgkpRegWriteDword(hDriverKey, L"Attach.RelativeX", 0);
+        (VOID)DxgkpRegWriteDword(hDriverKey, L"Attach.RelativeY", 0);
+    }
+    ZwClose(hDriverKey);
+    if (!NT_SUCCESS(Status))
+        return Status;
+
+    RtlStringCchPrintfW(DeviceValueName, RTL_NUMBER_OF(DeviceValueName), L"\\Device\\Video%lu", DeviceNumber);
+    Status = RtlWriteRegistryValue(RTL_REGISTRY_DEVICEMAP, L"VIDEO", DeviceValueName, REG_SZ,
+                                   DriverKey, (ULONG)((wcslen(DriverKey) + 1) * sizeof(WCHAR)));
+    if (!NT_SUCCESS(Status))
+        return Status;
+    MaxObjectNumber = DxgkpReadMaxObjectNumber();
+    if (MaxObjectNumber == (ULONG)-1 || MaxObjectNumber < DeviceNumber)
+    {
+        MaxObjectNumber = DeviceNumber;
+        Status = RtlWriteRegistryValue(RTL_REGISTRY_DEVICEMAP, L"VIDEO", L"MaxObjectNumber", REG_DWORD,
+                                       &MaxObjectNumber, sizeof(MaxObjectNumber));
+    }
+    return Status;
+}
+
+/* The display already claimed for the source, else a withdrawn one, else a new one */
+static NTSTATUS
+DxgkpSourceDisplayClaim(
+    _In_ PDXGKRNL_ADAPTER Adapter,
+    _In_ D3DDDI_VIDEO_PRESENT_SOURCE_ID SourceId,
+    _Out_ PDXGKP_SOURCE_DISPLAY *Claimed)
+{
+    PDXGKP_SOURCE_DISPLAY Display;
+    PDEVICE_OBJECT DeviceObject;
+    ULONG Withdrawn = MAXULONG;
+    ULONG Empty = MAXULONG;
+    ULONG Index;
+    NTSTATUS Status;
+
+    PAGED_CODE();
+    ASSERT(KeReadStateMutex(&g_SourceDisplayTableMutex) == 0);
+    *Claimed = NULL;
+    for (Index = 0; Index < RTL_NUMBER_OF(g_SourceDisplayDevices); Index++)
+    {
+        if (g_SourceDisplayDevices[Index] == NULL)
+        {
+            if (Empty == MAXULONG)
+                Empty = Index;
+            continue;
+        }
+        Display = (PDXGKP_SOURCE_DISPLAY)g_SourceDisplayDevices[Index]->DeviceExtension;
+        ASSERT(Display->Signature == DXGKP_SOURCE_DISPLAY_SIGNATURE);
+        (VOID)KeWaitForSingleObject(&Display->Mutex, Executive, KernelMode, FALSE, NULL);
+        if (Display->Adapter == Adapter && Display->VidPnSourceId == SourceId)
+        {
+            KeReleaseMutex(&Display->Mutex, FALSE);
+            *Claimed = Display;
+            return STATUS_SUCCESS;
+        }
+        if (Display->Adapter == NULL && Withdrawn == MAXULONG)
+            Withdrawn = Index;
+        KeReleaseMutex(&Display->Mutex, FALSE);
+    }
+
+    if (Withdrawn != MAXULONG)
+    {
+        Display = (PDXGKP_SOURCE_DISPLAY)g_SourceDisplayDevices[Withdrawn]->DeviceExtension;
+        (VOID)KeWaitForSingleObject(&Display->Mutex, Executive, KernelMode, FALSE, NULL);
+        ASSERT(Display->Adapter == NULL);
+        ASSERT(!Display->Published);
+        Display->Adapter = Adapter;
+        Display->VidPnSourceId = SourceId;
+        KeReleaseMutex(&Display->Mutex, FALSE);
+        *Claimed = Display;
+        return STATUS_SUCCESS;
+    }
+
+    if (Empty == MAXULONG)
+        return STATUS_INSUFFICIENT_RESOURCES;
+    Status = DxgkpSourceDisplayCreateDevice(SourceId, &DeviceObject);
+    if (!NT_SUCCESS(Status))
+        return Status;
+    Display = (PDXGKP_SOURCE_DISPLAY)DeviceObject->DeviceExtension;
+    Display->Adapter = Adapter;
+    InterlockedExchangePointer((PVOID *)&g_SourceDisplayDevices[Empty], DeviceObject);
+    *Claimed = Display;
+    return STATUS_SUCCESS;
+}
+
+static VOID
+DxgkpSourceDisplayRegisterAll(
+    _In_ PDXGKRNL_ADAPTER Adapter)
+{
+    PDXGKP_SOURCE_DISPLAY Display;
+    D3DDDI_VIDEO_PRESENT_SOURCE_ID SourceId;
+    BOOLEAN HostsDesktop;
+    NTSTATUS Status;
+
+    PAGED_CODE();
+    /* TODO: further sources of a display-only adapter */
+    if (Adapter->MiniportContext == NULL || Adapter->MiniportContext->IsDisplayOnlyDriver)
+        return;
+    HostsDesktop = DxgkIsDisplayAdapter(Adapter);
+    (VOID)KeWaitForSingleObject(&g_SourceDisplayTableMutex, Executive, KernelMode, FALSE, NULL);
+    for (SourceId = 0; SourceId < Adapter->NumberOfVideoPresentSources && SourceId < DXGKRNL_MAX_SOURCE_PRIMARIES; SourceId++)
+    {
+        /* The desktop source of the desktop adapter is the bridge device; every source of another adapter is a display */
+        if (HostsDesktop &&
+            !DxgkHotPlugWorkCoreSourceHasOwnPrimary(SourceId, 0, Adapter->NumberOfVideoPresentSources,
+                                                    DXGKRNL_MAX_SOURCE_PRIMARIES))
+        {
+            continue;
+        }
+        Status = DxgkpSourceDisplayClaim(Adapter, SourceId, &Display);
+        if (!NT_SUCCESS(Status))
+        {
+            DXGKRNL_WARN("DxgkpSourceDisplayRegisterAll: adapter %p source %u has no display 0x%08lX\n",
+                         Adapter, SourceId, Status);
+            continue;
+        }
+        (VOID)KeWaitForSingleObject(&Display->Mutex, Executive, KernelMode, FALSE, NULL);
+        ASSERT(Display->Adapter == Adapter);
+        ASSERT(Display->VidPnSourceId == SourceId);
+        Status = Display->Published ? STATUS_SUCCESS : DxgkpSourceDisplayPublish(Adapter, SourceId, Display->DeviceNumber);
+        Display->Published = NT_SUCCESS(Status);
+        KeReleaseMutex(&Display->Mutex, FALSE);
+        if (!NT_SUCCESS(Status))
+            DXGKRNL_WARN("DxgkpSourceDisplayRegisterAll: adapter %p source %u \\Device\\Video%lu not published 0x%08lX\n",
+                         Adapter, SourceId, Display->DeviceNumber, Status);
+    }
+    KeReleaseMutex(&g_SourceDisplayTableMutex, FALSE);
+}
+
+static VOID
+DxgkpSourceDisplayUnregisterAll(
+    _In_ PDXGKRNL_ADAPTER Adapter)
+{
+    PDXGKP_SOURCE_DISPLAY Display;
+    ULONG Index;
+
+    PAGED_CODE();
+    (VOID)KeWaitForSingleObject(&g_SourceDisplayTableMutex, Executive, KernelMode, FALSE, NULL);
+    for (Index = 0; Index < RTL_NUMBER_OF(g_SourceDisplayDevices); Index++)
+    {
+        if (g_SourceDisplayDevices[Index] == NULL)
+            continue;
+        Display = (PDXGKP_SOURCE_DISPLAY)g_SourceDisplayDevices[Index]->DeviceExtension;
+        (VOID)KeWaitForSingleObject(&Display->Mutex, Executive, KernelMode, FALSE, NULL);
+        if (Display->Adapter == Adapter)
+        {
+            /* The display driver keeps its mappings until it disables the PDEV; they go with the device */
+            if (Display->Published)
+                DxgkpRemoveDeviceMapEntry(Display->DeviceNumber);
+            Display->Published = FALSE;
+            Display->Adapter = NULL;
+        }
+        KeReleaseMutex(&Display->Mutex, FALSE);
+    }
+    KeReleaseMutex(&g_SourceDisplayTableMutex, FALSE);
+}
+
+/* The adapter and source a display device of the desktop scans out; the adapter is not referenced */
+NTSTATUS
+DxgkDisplayResolveVideoDevice(
+    _In_ PCUNICODE_STRING DeviceName,
+    _Out_ PDXGKRNL_ADAPTER *Adapter,
+    _Out_ D3DDDI_VIDEO_PRESENT_SOURCE_ID *SourceId)
+{
+    PDXGKP_SOURCE_DISPLAY Display;
+    UNICODE_STRING Name;
+    WCHAR Buffer[24];
+    NTSTATUS Status = STATUS_UNSUCCESSFUL;
+    ULONG Index;
+
+    PAGED_CODE();
+    *Adapter = NULL;
+    *SourceId = D3DDDI_ID_UNINITIALIZED;
+    (VOID)KeWaitForSingleObject(&g_SourceDisplayTableMutex, Executive, KernelMode, FALSE, NULL);
+    if (g_DisplayAdapter != NULL && g_DisplayAdapter->DisplayDeviceName[0] != L'\0')
+    {
+        RtlInitUnicodeString(&Name, g_DisplayAdapter->DisplayDeviceName);
+        if (RtlEqualUnicodeString(DeviceName, &Name, TRUE))
+        {
+            *Adapter = g_DisplayAdapter;
+            *SourceId = 0;
+            Status = STATUS_SUCCESS;
+        }
+    }
+    for (Index = 0; !NT_SUCCESS(Status) && Index < RTL_NUMBER_OF(g_SourceDisplayDevices); Index++)
+    {
+        if (g_SourceDisplayDevices[Index] == NULL)
+            continue;
+        Display = (PDXGKP_SOURCE_DISPLAY)g_SourceDisplayDevices[Index]->DeviceExtension;
+        (VOID)KeWaitForSingleObject(&Display->Mutex, Executive, KernelMode, FALSE, NULL);
+        if (Display->Published && Display->Adapter != NULL &&
+            NT_SUCCESS(RtlStringCchPrintfW(Buffer, RTL_NUMBER_OF(Buffer), L"\\Device\\Video%lu", Display->DeviceNumber)))
+        {
+            RtlInitUnicodeString(&Name, Buffer);
+            if (RtlEqualUnicodeString(DeviceName, &Name, TRUE))
+            {
+                *Adapter = Display->Adapter;
+                *SourceId = Display->VidPnSourceId;
+                Status = STATUS_SUCCESS;
+            }
+        }
+        KeReleaseMutex(&Display->Mutex, FALSE);
+    }
+    KeReleaseMutex(&g_SourceDisplayTableMutex, FALSE);
+    return Status;
+}
+
+/* An adapter that does not host the desktop still exposes its outputs as display devices */
+VOID
+DxgkDisplayRegisterSourceDisplays(
+    _In_ PDXGKRNL_ADAPTER Adapter)
+{
+    PAGED_CODE();
+    ASSERT(Adapter != NULL);
+    ASSERT(!DxgkIsDisplayAdapter(Adapter));
+    DxgkpSourceDisplayRegisterAll(Adapter);
+}
 
 /* ========================================================================
  * DxgkDisplayRegister
@@ -5782,6 +6514,7 @@ DxgkDisplayRegister(
     DXGKRNL_INFO("DISPLAY_BRIDGE: adapter %p desktop ready %lux%lu (%s)\n",
                  Adapter, Adapter->CommittedWidth, Adapter->CommittedHeight,
                  Adapter->HeadlessDesktop ? "detached" : "scanout");
+    DxgkpSourceDisplayRegisterAll(Adapter);
     Status = STATUS_SUCCESS;
 
 Cleanup:
@@ -5906,7 +6639,10 @@ DxgkDisplayUnregister(
 
     PAGED_CODE();
 
-    if (Adapter == NULL || g_DisplayAdapter != Adapter)
+    if (Adapter == NULL)
+        return;
+    DxgkpSourceDisplayUnregisterAll(Adapter);
+    if (g_DisplayAdapter != Adapter)
         return;
     if (Adapter != NULL)
     {
@@ -6033,6 +6769,13 @@ DxgkDisplayDispatchPnp(
     _In_  PDEVICE_OBJECT DeviceObject,
     _In_  PIRP           Irp)
 {
+    PDXGKP_SOURCE_DISPLAY Display = DxgkpSourceDisplayFromDevice(DeviceObject);
+
+    if (Display != NULL)
+    {
+        (VOID)DxgkpSourceDisplayPnp(Display, Irp);
+        return TRUE;
+    }
     if (DeviceObject != g_DisplayDeviceObject)
         return FALSE;
 
@@ -6055,6 +6798,13 @@ DxgkDisplayDispatchIoctl(
     _In_  PIRP           Irp,
     _Out_ PNTSTATUS      Status)
 {
+    PDXGKP_SOURCE_DISPLAY Display = DxgkpSourceDisplayFromDevice(DeviceObject);
+
+    if (Display != NULL)
+    {
+        *Status = DxgkpSourceDisplayDispatch(Display, Irp);
+        return TRUE;
+    }
     if (DeviceObject == NULL || g_DisplayDeviceObject == NULL ||
         DeviceObject != g_DisplayDeviceObject)
     {
@@ -6076,7 +6826,7 @@ DxgkDisplayDispatchCreate(
     _In_  PDEVICE_OBJECT DeviceObject,
     _In_  PIRP           Irp)
 {
-    if (DeviceObject != g_DisplayDeviceObject)
+    if (DeviceObject != g_DisplayDeviceObject && DxgkpSourceDisplayFromDevice(DeviceObject) == NULL)
         return FALSE;
 
     DxgkpDisplayCreate(DeviceObject, Irp);
@@ -6093,7 +6843,7 @@ DxgkDisplayDispatchClose(
     _In_  PDEVICE_OBJECT DeviceObject,
     _In_  PIRP           Irp)
 {
-    if (DeviceObject != g_DisplayDeviceObject)
+    if (DeviceObject != g_DisplayDeviceObject && DxgkpSourceDisplayFromDevice(DeviceObject) == NULL)
         return FALSE;
 
     DxgkpDisplayClose(DeviceObject, Irp);

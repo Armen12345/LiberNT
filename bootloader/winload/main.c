@@ -289,7 +289,7 @@ OslLoadNetworkDebugger(
     _In_ PDK_DEVICE Device,
     _In_ PCSTR Directory)
 {
-    PLDR_DATA_TABLE_ENTRY Entry;
+    PKLDR_DATA_TABLE_ENTRY Entry;
     ULONG i;
 
     if (!PeLoadModule(&LoaderBlock->LoadOrderListHead,
@@ -319,7 +319,7 @@ OslLoadNetworkDebugger(
 }
 
 static
-PLDR_DATA_TABLE_ENTRY
+PKLDR_DATA_TABLE_ENTRY
 OslLoadCoreImage(
     _Inout_ PLOADER_PARAMETER_BLOCK LoaderBlock,
     _In_ PDK_DEVICE Device,
@@ -329,7 +329,7 @@ OslLoadCoreImage(
     _In_ TYPE_OF_MEMORY MemoryType)
 {
     CHAR Path[OSL_PATH_CHARS];
-    PLDR_DATA_TABLE_ENTRY Entry;
+    PKLDR_DATA_TABLE_ENTRY Entry;
     PVOID Base;
 
     if (!NT_SUCCESS(RtlStringCbPrintfA(Path, sizeof(Path), "%s%ws", Directory, FileName)))
@@ -364,7 +364,7 @@ OslMain(VOID)
     PVOID Image = NULL;
     ULONG ImageSize = 0;
     PLOADER_PARAMETER_BLOCK LoaderBlock;
-    PLDR_DATA_TABLE_ENTRY Kernel, Hal, Video;
+    PKLDR_DATA_TABLE_ENTRY Kernel, Hal, Video;
     PBM_ENTRY Entry;
     DK_DEVICE OsDevice;
     SIZE_T Length;
@@ -498,6 +498,8 @@ OslMain(VOID)
         return;
     }
 
+    OslLoadHalExtensions(LoaderBlock, &OsDevice, Directory);
+
     OslTrace("OS loader: loading the NLS files");
     if (!OslLoadNlsData(LoaderBlock, &OsDevice, SystemRoot))
     {
@@ -528,11 +530,11 @@ OslMain(VOID)
     }
 
     OslTrace("OS loader: handing over, boot device %s, hal device %s",
-             LoaderBlock->ArcBootDeviceName ? LoaderBlock->ArcBootDeviceName : "(none)",
-             LoaderBlock->ArcHalDeviceName ? LoaderBlock->ArcHalDeviceName : "(none)");
+             LoaderBlock->ArcBootDeviceName ? (PCSTR)VaToPa(LoaderBlock->ArcBootDeviceName) : "(none)",
+             LoaderBlock->ArcHalDeviceName ? (PCSTR)VaToPa(LoaderBlock->ArcHalDeviceName) : "(none)");
     OslTrace("OS loader: nt path %s, options %s",
-             LoaderBlock->NtBootPathName ? LoaderBlock->NtBootPathName : "(none)",
-             LoaderBlock->LoadOptions ? LoaderBlock->LoadOptions : "(none)");
+             LoaderBlock->NtBootPathName ? (PCSTR)VaToPa(LoaderBlock->NtBootPathName) : "(none)",
+             LoaderBlock->LoadOptions ? (PCSTR)VaToPa(LoaderBlock->LoadOptions) : "(none)");
     OslTrace("OS loader: entry %p, loader block %p, arc disks %p, registry %lu bytes at %p",
              Kernel->EntryPoint,
              PaToVa(LoaderBlock),
@@ -566,6 +568,7 @@ BlMain(VOID)
         FwPrint(L"The memory map could not be read.\r\n");
         return;
     }
+    OslArchReserveFirmwareMemory(NULL);
 
     BlHeapAllocator = MmHeapAllocate;
 

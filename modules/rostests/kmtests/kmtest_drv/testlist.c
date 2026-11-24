@@ -14,6 +14,7 @@ KMT_TESTFUNC Test_DxgkChildConnectionRecord;
 KMT_TESTFUNC Test_DxgkChildDescriptor;
 KMT_TESTFUNC Test_DxgkDisplayDetectControl;
 KMT_TESTFUNC Test_DxgkPostDisplayHandoff;
+KMT_TESTFUNC Test_DxgkStopScreen;
 KMT_TESTFUNC Test_DxgkPresentUserSource;
 KMT_TESTFUNC Test_MonitorBrightnessKey;
 KMT_TESTFUNC Test_DxgkGpuVaAddress;
@@ -281,6 +282,7 @@ KMT_TESTFUNC Test_KeStandbySteal;
 KMT_TESTFUNC Test_KeDeferredReady;
 KMT_TESTFUNC Test_KeIdleSteal;
 KMT_TESTFUNC Test_KeCacheInvalidation;
+KMT_TESTFUNC Test_KeClockHeldOff;
 KMT_TESTFUNC Test_KeClockKeepAlive;
 KMT_TESTFUNC Test_KeClockWatchdog;
 KMT_TESTFUNC Test_KeModern;
@@ -317,6 +319,7 @@ KMT_TESTFUNC Test_KeExpandKernelStack;
 KMT_TESTFUNC Test_KeFloatPointState;
 KMT_TESTFUNC Test_KeGuardedMutex;
 KMT_TESTFUNC Test_CmBootFlush;
+KMT_TESTFUNC Test_CmSaveKeyFlush;
 KMT_TESTFUNC Test_CmCallbacks;
 KMT_TESTFUNC Test_CmTransactions;
 KMT_TESTFUNC Test_CmKeyKM;
@@ -353,11 +356,13 @@ KMT_TESTFUNC Test_KeCycleTime;
 KMT_TESTFUNC Test_KeQueryBasePriority;
 KMT_TESTFUNC Test_KeProcessor;
 KMT_TESTFUNC Test_KePriorityRaise;
+KMT_TESTFUNC Test_KeQuantumBalance;
 KMT_TESTFUNC Test_KeQuantumEnd;
 KMT_TESTFUNC Test_KeSpinLock;
 KMT_TESTFUNC Test_KeThreadedDpc;
 KMT_TESTFUNC Test_KeTime;
 KMT_TESTFUNC Test_KeTimer2KM;
+KMT_TESTFUNC Test_KeUnalignedAccess;
 KMT_TESTFUNC Test_MmSecureKM;
 KMT_TESTFUNC Test_KeTimer;
 KMT_TESTFUNC Test_KeWaitMultiple;
@@ -379,6 +384,7 @@ KMT_TESTFUNC Test_MmUserLayout;
 KMT_TESTFUNC Test_MmLoaderBlock;
 KMT_TESTFUNC Test_NdisIfProvider;
 KMT_TESTFUNC Test_NdisRwLock;
+KMT_TESTFUNC Test_NdisWdiIhvResponse;
 KMT_TESTFUNC Test_NdisWdiStationCaps;
 KMT_TESTFUNC Test_NdisProcessorGroup;
 KMT_TESTFUNC Test_NdisLegacyHelpers;
@@ -503,6 +509,7 @@ const KMT_TEST TestList[] =
     { "DxgkChildDescriptor",               Test_DxgkChildDescriptor },
     { "DxgkDisplayDetectControl",          Test_DxgkDisplayDetectControl },
     { "DxgkPostDisplayHandoff",            Test_DxgkPostDisplayHandoff },
+    { "DxgkStopScreen",                    Test_DxgkStopScreen },
     { "DxgkPresentUserSource",             Test_DxgkPresentUserSource },
     { "DxgkGpuVaAddress",                   Test_DxgkGpuVaAddress },
     { "DxgkGpuVaPageTable",                 Test_DxgkGpuVaPageTable },
@@ -678,6 +685,7 @@ const KMT_TEST TestList[] =
     { "CmCallbacks",                        Test_CmCallbacks },
     { "CmTransactions",                     Test_CmTransactions },
     { "CmKeyKM",                            Test_CmKeyKM },
+    { "CmSaveKeyFlush",                     Test_CmSaveKeyFlush },
     { "EtwRegisterKM",                      Test_EtwRegisterKM },
     { "EtwSessionKM",                       Test_EtwSessionKM },
     { "EtwSessionIrqlKM",                   Test_EtwSessionIrqlKM },
@@ -752,6 +760,7 @@ const KMT_TEST TestList[] =
     { "KeDeferredReady",                    Test_KeDeferredReady },
     { "KeIdleSteal",                        Test_KeIdleSteal },
     { "KeCacheInvalidation",                Test_KeCacheInvalidation },
+    { "KeClockHeldOff",                     Test_KeClockHeldOff },
     { "KeClockKeepAlive",                   Test_KeClockKeepAlive },
     { "KeCycleTime",                        Test_KeCycleTime },
     { "-KeClockWatchdog",                   Test_KeClockWatchdog },
@@ -810,6 +819,7 @@ const KMT_TEST TestList[] =
     { "KeQueryBasePriority",                Test_KeQueryBasePriority },
     { "KeProcessor",                        Test_KeProcessor },
     { "KePriorityRaise",                    Test_KePriorityRaise },
+    { "KeQuantumBalance",                   Test_KeQuantumBalance },
     { "KeQuantumEnd",                       Test_KeQuantumEnd },
     { "KeSemaphore",                        Test_KeSemaphore },
     { "KeSpinLock",                         Test_KeSpinLock },
@@ -817,6 +827,7 @@ const KMT_TEST TestList[] =
     { "KeTime",                             Test_KeTime },
     { "KeTimer",                            Test_KeTimer },
     { "KeTimer2KM",                         Test_KeTimer2KM },
+    { "KeUnalignedAccess",                  Test_KeUnalignedAccess },
     { "KeWaitMultiple",                     Test_KeWaitMultiple },
     { "KernelType",                         Test_KernelType },
     { "MmAllocateContiguousNode",           Test_MmAllocateContiguousNode },
@@ -844,6 +855,7 @@ const KMT_TEST TestList[] =
     { "MonitorBrightnessKey",               Test_MonitorBrightnessKey },
     { "NdisIfProvider",                     Test_NdisIfProvider },
     { "NdisRwLock",                         Test_NdisRwLock },
+    { "NdisWdiIhvResponse",                 Test_NdisWdiIhvResponse },
     { "NdisWdiStationCaps",                 Test_NdisWdiStationCaps },
     { "NdisProcessorGroup",                 Test_NdisProcessorGroup },
     { "NdisLegacyHelpers",                  Test_NdisLegacyHelpers },

@@ -23,6 +23,7 @@ extern void func_CalendarDateTime(void);
 extern void func_CallbackCallingConventions(void);
 extern void func_CallbackMayRunLong(void);
 extern void func_CdfsVolume(void);
+extern void func_CreateSymbolicLink(void);
 extern void func_SataDiskAddress(void);
 extern void func_ExportStubs(void);
 extern void func_DirectoryEntryUpdates(void);
@@ -54,6 +55,7 @@ extern void func_DeviceIoControl(void);
 extern void func_DiskAttributes(void);
 extern void func_DiskSignatureCollision(void);
 extern void func_DispatcherStress(void);
+extern void func_ProcessorAffinity(void);
 extern void func_ProcessorGroups(void);
 extern void func_EmulatedProcess(void);
 extern void func_dosdev(void);
@@ -125,6 +127,7 @@ extern void func_TzSpecificLocalTimeEx(void);
 extern void func_TebSegmentAfterWait(void);
 extern void func_SharedMemorySecurity(void);
 extern void func_SharedMemoryTransfer(void);
+extern void func_MapFlush(void);
 extern void func_StarvationBoost(void);
 extern void func_StdHandleInheritance(void);
 extern void func_StreamRename(void);
@@ -256,6 +259,7 @@ const struct test winetest_testlist[] =
     { "CallbackCallingConventions", func_CallbackCallingConventions },
     { "CallbackMayRunLong",          func_CallbackMayRunLong },
     { "CdfsVolume", func_CdfsVolume },
+    { "CreateSymbolicLink", func_CreateSymbolicLink },
     { "SataDiskAddress", func_SataDiskAddress },
     { "Mailslot", func_Mailslot },
     { "DirectoryEntryUpdates", func_DirectoryEntryUpdates },
@@ -287,6 +291,7 @@ const struct test winetest_testlist[] =
     { "DiskAttributes",              func_DiskAttributes },
     { "DiskSignatureCollision",      func_DiskSignatureCollision },
     { "DispatcherStress",            func_DispatcherStress },
+    { "ProcessorAffinity",           func_ProcessorAffinity },
     { "ProcessorGroups",             func_ProcessorGroups },
     { "EmulatedProcess",             func_EmulatedProcess },
     { "dosdev",                      func_dosdev },
@@ -358,6 +363,7 @@ const struct test winetest_testlist[] =
     { "SecurityBaseApis",            func_SecurityBaseApis },
     { "SharedMemorySecurity",        func_SharedMemorySecurity },
     { "SharedMemoryTransfer",        func_SharedMemoryTransfer },
+    { "MapFlush",                    func_MapFlush },
     { "StarvationBoost",             func_StarvationBoost },
     { "StdHandleInheritance",        func_StdHandleInheritance },
     { "StreamRename",                func_StreamRename },

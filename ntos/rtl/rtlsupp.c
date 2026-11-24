@@ -111,6 +111,13 @@ RtlpCheckForActiveDebugger(VOID)
 
 BOOLEAN
 NTAPI
+RtlpKernelDebuggerEnabled(VOID)
+{
+    return KdDebuggerEnabled;
+}
+
+BOOLEAN
+NTAPI
 RtlpDebugPrintWanted(
     _Out_ PNTSTATUS Status)
 {
@@ -370,13 +377,23 @@ RtlPcToFileHeader(
     _In_ PVOID PcValue,
     _Out_ PVOID *BaseOfImage)
 {
-    PLDR_DATA_TABLE_ENTRY Entry;
+    PKLDR_DATA_TABLE_ENTRY Entry;
     BOOLEAN InSystem;
     KIRQL OldIrql;
 
     *BaseOfImage = NULL;
     if ((ULONG_PTR)PcValue <= (ULONG_PTR)MmHighestUserAddress)
         return NULL;
+
+    /* FIXME: above DISPATCH_LEVEL a held module lock makes the lookup fail; Windows reads an inverted function table there */
+    if (KeGetCurrentIrql() > DISPATCH_LEVEL)
+    {
+        if (!KeTryToAcquireSpinLockAtDpcLevel(&PsLoadedModuleSpinLock))
+            return NULL;
+        *BaseOfImage = KiPcToFileHeader(PcValue, &Entry, FALSE, &InSystem);
+        KeReleaseSpinLockFromDpcLevel(&PsLoadedModuleSpinLock);
+        return *BaseOfImage;
+    }
 
     KeAcquireSpinLock(&PsLoadedModuleSpinLock, &OldIrql);
     *BaseOfImage = KiPcToFileHeader(PcValue, &Entry, FALSE, &InSystem);

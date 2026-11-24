@@ -11,9 +11,13 @@
  * image writable only for the duration of one explicit operation.
  */
 
+#include <assert.h>
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
+#include <pthread.h>
+#include <signal.h>
 #include <inttypes.h>
 #include <time.h>
 #include <stdint.h>
@@ -21,14 +25,23 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#if __has_include(<sys/sysmacros.h>)
+#include <sys/sysmacros.h>
+#endif
 #include <sys/statvfs.h>
 #include <sys/types.h>
 #include <sys/xattr.h>
 #include <unistd.h>
 
+#include <atomic>
+#include <condition_variable>
 #include <memory>
+#include <mutex>
+#include <shared_mutex>
+#include <thread>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 #include <map>
@@ -41,8 +54,23 @@ extern "C" {
 #include <expandcore.h>
 }
 
-typedef std::vector<std::string> NtfsDirectoryListing;
+struct NtfsDirectoryName
+{
+    std::string Name;
+    UINT64 Reference;
+    mode_t Type;
+};
 
+struct NtfsDirectoryListing
+{
+    UINT64 Self;
+    UINT64 Parent;
+    std::vector<NtfsDirectoryName> Entries;
+};
+
+
+extern "C" NTSTATUS
+NtfsFlushVolumeContext(void* Context);
 
 extern "C" unsigned long long
 NtfsQueryTicks(void)
@@ -53,8 +81,71 @@ NtfsQueryTicks(void)
 
 #if NTFSLIB_HAVE_FUSE
 #define FUSE_USE_VERSION 31
-#include <fuse.h>
+#include <fuse_lowlevel.h>
 #endif
+
+/* One piece of a plain data stream: file bytes [Start, End) live at image byte Disk. */
+struct NtfsFastExtent
+{
+    ULONGLONG Start;
+    ULONGLONG End;
+    ULONGLONG Disk;
+};
+
+/*
+ * Data I/O that changes no allocation runs outside the request lock, on any thread, against this
+ * snapshot. Everything else on the file first waits such I/O out and takes the snapshot down.
+ */
+struct NtfsFastFile
+{
+    PNtfsFileRecord File;
+    struct NtfsFuseOpenFile* Owner;
+    std::shared_mutex Lock;
+    std::atomic<bool> Armed{false};
+    bool ReadOk;
+    bool WriteOk;
+    bool SetIdChecked;
+    ULONGLONG Committed;
+    ULONGLONG DataSize;
+    std::vector<NtfsFastExtent> Extents;
+    /* Writes past the valid data length: [Committed, Frontier) is contiguous, Ahead holds the rest. */
+    std::mutex PendingLock;
+    ULONGLONG Frontier;
+    std::vector<std::pair<ULONGLONG, ULONGLONG>> Ahead;
+    std::atomic<bool> Written{false};
+    std::atomic<UINT64> WriteTime{0};
+};
+
+struct NtfsFuseOpenFile
+{
+    PNtfsFileRecord File;
+    unsigned References;
+    /* Sequential growth preallocates; the last close trims it like NT cleanup. */
+    bool Written;
+    bool Preallocated;
+    /* The last name is gone; the records go with the last handle. */
+    bool Unlinked;
+    /* Like NT, data writes keep their write time in memory and the record
+     * takes it at fsync, explicit time changes or the last close. */
+    UINT64 PendingWriteTime;
+    /* relatime: the first read of an open may move the access time. */
+    UINT64 PendingAccessTime;
+    bool AccessChecked;
+    /* A write by an unprivileged caller has dropped set-id bits. */
+    bool SetIdChecked;
+    NtfsFastFile* Fast;
+    unsigned DataRequests;
+};
+
+struct NtfsFuseInode
+{
+    ULONGLONG Reference;
+    uint64_t Lookups;
+    bool Unlinked;
+    /* Where the last listing with attributes showed this inode: directory and position. */
+    uint64_t ListDirectory;
+    size_t ListIndex;
+};
 
 struct NtfsFuseState
 {
@@ -62,21 +153,76 @@ struct NtfsFuseState
     uid_t Owner;
     gid_t Group;
     bool Writable;
-    /* Values are shared with open directory handles so a cache
-     * invalidation cannot free a listing a reader still holds.
+    bool WritebackCache;
+    bool DirectIo;
+    bool NoAtime;
+    bool StrictAtime;
+#if NTFSLIB_HAVE_FUSE
+    struct fuse_session* Session;
+    size_t SpliceThreshold;
+    std::unique_ptr<NtfsFileRecord, decltype(&NtfsFileRecordDestroy)> LookupRecord{nullptr, NtfsFileRecordDestroy};
+    std::vector<WCHAR> LookupName;
+    UINT64 LookupParent;
+    UINT64 LookupGeneration;
+    std::unordered_map<UINT64, decltype(LookupRecord)> ListedRecords;
+    UINT64 ListingGeneration;
+    std::unique_ptr<NtfsFileRecord, decltype(&NtfsFileRecordDestroy)> ParentRecord{nullptr, NtfsFileRecordDestroy};
+    UINT64 ParentGeneration;
+    bool ParentFromLookup;
+#endif
+    /* Inodes the kernel holds, keyed by inode number, with lookup counts. */
+    std::unordered_map<uint64_t, NtfsFuseInode> Inodes;
+    /* One record per open file, shared by all its handles. */
+    std::unordered_map<uint64_t, NtfsFuseOpenFile> OpenFiles;
+    /* Values are shared with the scans below so a cache invalidation
+     * cannot free a listing a reader still walks.
      */
-    std::unordered_map<std::string,
-                       std::shared_ptr<NtfsDirectoryListing>>
-        DirectoryCache;
-    /* Open-record cache for mounted operation: repeated opens of the same
-     * path reuse one validated record instead of re-walking the $I30
-     * tree. Entries are owned by the cache (release skips them via the
-     * low fh bit) and the map is dropped on any mutation or unmount.
+    std::unordered_map<uint64_t, std::shared_ptr<NtfsDirectoryListing>> DirectoryCache;
+    /*
+     * Directories are read without an open: a scan is tied to the listing it started on by a
+     * number in the upper bits of its offsets. The last few listings of a directory are kept.
      */
-    std::unordered_map<std::string, PNtfsFileRecord> RecordCache;
+    std::unordered_map<uint64_t, std::vector<std::pair<uint32_t, std::shared_ptr<NtfsDirectoryListing>>>> DirectoryScans;
+    bool OpenlessDirectories;
+    std::vector<UCHAR> ReadBuffer;
+    /* Lazy access times of closed files, by file reference, as NT keeps them. */
+    std::unordered_map<uint64_t, UINT64> PendingAccess;
+    std::mutex RequestLock;
+    /* Helper threads drain the request queue when the kernel has several requests waiting. */
+    std::vector<std::thread> Workers;
+    std::mutex WorkerLock;
+    std::condition_variable WorkerWake;
+    unsigned WorkerTokens;
+    std::atomic<unsigned> WorkersSleeping{0};
+    std::atomic<unsigned> WorkersDone{0};
+    std::atomic<bool> WorkerStop{false};
+    bool RingTransport;
+    /*
+     * A reader walking a directory opens its files in listing order: the data of the small ones
+     * ahead of it is pushed into the kernel's page cache, so each costs an open and no read.
+     */
+    std::thread PrefetchThread;
+    std::mutex PrefetchLock;
+    std::condition_variable PrefetchWake;
+    std::shared_ptr<NtfsDirectoryListing> PrefetchListing;
+    size_t PrefetchFrom;
+    size_t PrefetchTo;
+    uint64_t PrefetchJobGeneration;
+    bool PrefetchPending;
+    /* Held shared while pushed data is on its way; taken exclusive by whatever may free clusters. */
+    std::shared_mutex PrefetchGate;
+    std::atomic<uint64_t> PrefetchGeneration{0};
+    const NtfsDirectoryListing* PrefetchStream;
+    size_t PrefetchNext;
+    size_t PrefetchBatch;
+    std::mutex StoredLock;
+    std::unordered_set<uint64_t> Stored;
 };
 
-#define NTFS_FUSE_CACHED_RECORD_BIT ((uint64_t)1)
+#ifndef STATUS_INVALID_HANDLE
+#define STATUS_INVALID_HANDLE ((NTSTATUS)0xC0000008)
+#endif
+#define NTFS_MAX_PATH_WCHARS 32768
 
 static int
 NtStatusToErrno(NTSTATUS Status)
@@ -86,7 +232,13 @@ NtStatusToErrno(NTSTATUS Status)
         case STATUS_SUCCESS:
             return 0;
         case STATUS_NOT_FOUND:
+        case STATUS_OBJECT_NAME_NOT_FOUND:
+        case STATUS_OBJECT_PATH_NOT_FOUND:
             return ENOENT;
+        case STATUS_INVALID_HANDLE:
+            return ESTALE;
+        case STATUS_SHARING_VIOLATION:
+            return EBUSY;
         case STATUS_NO_MORE_FILES:
             return ENOENT;
         case STATUS_END_OF_FILE:
@@ -170,6 +322,7 @@ Utf8ToNtfsString(const char* Input,
     Output.clear();
     if (!Input || (!AllowEmpty && *Input == '\0'))
         return false;
+    Output.reserve(strlen(Input) + 1);
 
     while (*Cursor)
     {
@@ -217,6 +370,8 @@ Utf8ToNtfsString(const char* Input,
             return false;
         }
 
+        if (TranslateSeparators && CodePoint == '\\')
+            return false;
         if (TranslateSeparators && CodePoint == '/')
             CodePoint = '\\';
         if (!AppendUtf16(CodePoint, Output))
@@ -525,13 +680,130 @@ NtfsTimeToTimespec(UINT64 NtfsTime)
     const UINT64 EpochDifference = UINT64_C(116444736000000000);
     struct timespec Result = {};
 
-    if (NtfsTime <= EpochDifference)
+    if (NtfsTime == 0)
         return Result;
+    if (NtfsTime < EpochDifference)
+    {
+        UINT64 Before = EpochDifference - NtfsTime;
+        UINT64 Seconds = (Before + UINT64_C(9999999)) / UINT64_C(10000000);
+
+        Result.tv_sec = -(time_t)Seconds;
+        Result.tv_nsec = (long)((Seconds * UINT64_C(10000000) - Before) * 100);
+        return Result;
+    }
 
     NtfsTime -= EpochDifference;
     Result.tv_sec = (time_t)(NtfsTime / UINT64_C(10000000));
     Result.tv_nsec = (long)((NtfsTime % UINT64_C(10000000)) * 100);
     return Result;
+}
+
+/*
+ * POSIX ownership, mode and device numbers in the EAs Linux ntfs3 and WSL
+ * use: $LXUID, $LXGID, $LXMOD (the whole st_mode) and $LXDEV (major << 20 |
+ * minor, as ntfs3 writes it), each a little-endian 32-bit value.
+ */
+struct NtfsPosixMetadata
+{
+    bool HasUid, HasGid, HasMode, HasDev;
+    UINT32 Uid, Gid, Mode, Dev;
+};
+
+static const char* const NtfsPosixEaNames[] = {"$LXUID", "$LXGID", "$LXMOD", "$LXDEV"};
+
+static bool
+IsPosixEaName(const UCHAR* Name, size_t Length)
+{
+    return Length == 6 && strncasecmp((const char*)Name, "$LX", 3) == 0 &&
+           (strncasecmp((const char*)Name, "$LXUID", 6) == 0 ||
+            strncasecmp((const char*)Name, "$LXGID", 6) == 0 ||
+            strncasecmp((const char*)Name, "$LXMOD", 6) == 0 ||
+            strncasecmp((const char*)Name, "$LXDEV", 6) == 0);
+}
+
+static void
+ReadPosixMetadata(PNtfsFileRecord File, NtfsPosixMetadata* Metadata)
+{
+    std::vector<UCHAR> Raw;
+    const UCHAR* Data;
+    ULONG Length = 0;
+    ULONG Offset = 0;
+    NtfsExtendedAttributeView View;
+    PAttribute Ea;
+
+    memset(Metadata, 0, sizeof(*Metadata));
+    if (!NtfsFileRecordGetAttribute(File, TypeEAInformation, NULL))
+        return;
+    Ea = NtfsFileRecordGetAttribute(File, TypeEA, NULL);
+    if (Ea && !Ea->IsNonResident && Ea->Resident.DataOffset <= Ea->Length &&
+        Ea->Resident.DataLength <= Ea->Length - Ea->Resident.DataOffset)
+    {
+        Data = (const UCHAR*)Ea + Ea->Resident.DataOffset;
+        Length = Ea->Resident.DataLength;
+    }
+    else
+    {
+        if (NtfsFileRecordReadExtendedAttributes(File, NULL, &Length, NULL) != STATUS_BUFFER_TOO_SMALL || Length == 0)
+            return;
+        Raw.resize(Length);
+        if (!NT_SUCCESS(NtfsFileRecordReadExtendedAttributes(File, Raw.data(), &Length, NULL)))
+            return;
+        Data = Raw.data();
+    }
+    while (NT_SUCCESS(NtfsGetNextExtendedAttribute(Data, Length, &Offset, &View)))
+    {
+        UINT32 Value;
+
+        if (View.ValueLength != sizeof(Value) || View.NameLength != 6)
+            continue;
+        memcpy(&Value, View.Value, sizeof(Value));
+        if (strncasecmp((const char*)View.Name, "$LXUID", 6) == 0)
+            Metadata->HasUid = true, Metadata->Uid = Value;
+        else if (strncasecmp((const char*)View.Name, "$LXGID", 6) == 0)
+            Metadata->HasGid = true, Metadata->Gid = Value;
+        else if (strncasecmp((const char*)View.Name, "$LXMOD", 6) == 0)
+            Metadata->HasMode = true, Metadata->Mode = Value;
+        else if (strncasecmp((const char*)View.Name, "$LXDEV", 6) == 0)
+            Metadata->HasDev = true, Metadata->Dev = Value;
+    }
+}
+
+static ULONG
+BuildPosixUpdates(NtfsExtendedAttributeUpdate (&Updates)[4],
+                  const UINT32* Uid,
+                  const UINT32* Gid,
+                  const UINT32* Mode,
+                  const UINT32* Dev)
+{
+    const UINT32* Values[] = {Uid, Gid, Mode, Dev};
+    ULONG Count = 0;
+
+    for (ULONG Index = 0; Index < 4; Index++)
+    {
+        if (!Values[Index])
+            continue;
+        Updates[Count] = {};
+        Updates[Count].Operation = NTFS_EA_UPDATE_SET;
+        Updates[Count].NameLength = 6;
+        Updates[Count].ValueLength = sizeof(UINT32);
+        Updates[Count].Name = (const UCHAR*)NtfsPosixEaNames[Index];
+        Updates[Count].Value = (const UCHAR*)Values[Index];
+        Count++;
+    }
+    return Count;
+}
+
+static NTSTATUS
+WritePosixMetadata(PNtfsFileRecord File,
+                   const UINT32* Uid,
+                   const UINT32* Gid,
+                   const UINT32* Mode,
+                   const UINT32* Dev)
+{
+    NtfsExtendedAttributeUpdate Updates[4];
+    ULONG Count = BuildPosixUpdates(Updates, Uid, Gid, Mode, Dev);
+
+    return Count ? NtfsFileRecordUpdateExtendedAttributes(File, Updates, Count) : STATUS_SUCCESS;
 }
 
 static NTSTATUS
@@ -540,29 +812,40 @@ FillStatFromRecord(PNtfsFileRecord File,
                    struct stat* Stat)
 {
     PFileRecordHeader Header = NtfsFileRecordGetHeader(File);
-    PAttribute Data = NtfsFileRecordGetAttribute(File, TypeData, NULL);
     PStandardInformationEx Standard = NULL;
     PUCHAR StandardData = NULL;
     NTSTATUS StandardStatus;
 
     memset(Stat, 0, sizeof(*Stat));
-    Stat->st_ino = Header->MFTRecordNumber;
+    Stat->st_ino = (ino_t)(NtfsFileRecordGetReference(File) & UINT64_C(0x0000FFFFFFFFFFFF));
     Stat->st_uid = State->Owner;
     Stat->st_gid = State->Group;
     Stat->st_blksize =
         NtfsVolumeGetBytesPerSector(State->Volume) *
         NtfsVolumeGetSectorsPerCluster(State->Volume);
-    Stat->st_nlink = Header->HardLinkCount ? Header->HardLinkCount : 1;
+    Stat->st_nlink = NtfsFileRecordGetLinkCount(File);
 
     if (Header->Flags & FR_IS_DIRECTORY)
     {
-        Stat->st_mode = S_IFDIR | 0555;
+        Stat->st_mode = S_IFDIR | (State->Writable ? 0755 : 0555);
     }
     else
     {
-        Stat->st_mode = S_IFREG | 0444;
+        PAttribute Data = NtfsFileRecordGetAttribute(File, TypeData, NULL);
+
+        Stat->st_mode = S_IFREG | (State->Writable ? 0755 : 0555);
         Stat->st_size = (off_t)AttributeSize(Data);
-        Stat->st_blocks = (blkcnt_t)((Stat->st_size + 511) / 512);
+        if (Data && Data->IsNonResident)
+        {
+            Stat->st_blocks = (blkcnt_t)(
+                (Data->Flags & (ATTR_COMPRESSED | ATTR_SPARSE)
+                     ? Data->NonResident.CompressedDataSize
+                     : Data->NonResident.AllocatedSize) / 512);
+        }
+        else
+        {
+            Stat->st_blocks = (blkcnt_t)((Stat->st_size + 511) / 512);
+        }
     }
 
     StandardStatus = NtfsFileRecordGetAttributeData(
@@ -576,6 +859,34 @@ FillStatFromRecord(PNtfsFileRecord File,
         Stat->st_ctim = NtfsTimeToTimespec(Standard->ChangeTime);
         Stat->st_mtim = NtfsTimeToTimespec(Standard->LastWriteTime);
         Stat->st_atim = NtfsTimeToTimespec(Standard->LastAccessTime);
+        {
+            NtfsPosixMetadata Metadata;
+
+            ReadPosixMetadata(File, &Metadata);
+            if (Metadata.HasUid)
+                Stat->st_uid = Metadata.Uid;
+            if (Metadata.HasGid)
+                Stat->st_gid = Metadata.Gid;
+            if (Metadata.HasMode)
+            {
+                mode_t Type = Metadata.Mode & S_IFMT;
+
+                if (Header->Flags & FR_IS_DIRECTORY)
+                    Type = S_IFDIR;
+                else if (Type != S_IFIFO && Type != S_IFSOCK && Type != S_IFCHR && Type != S_IFBLK)
+                    Type = S_IFREG;
+                Stat->st_mode = Type | (Metadata.Mode & 07777);
+                if (Type != S_IFREG && Type != S_IFDIR)
+                    Stat->st_size = 0;
+            }
+            if (Metadata.HasDev && (S_ISCHR(Stat->st_mode) || S_ISBLK(Stat->st_mode)))
+                Stat->st_rdev = makedev(Metadata.Dev >> 20, Metadata.Dev & 0xFFFFF);
+        }
+        if (!(Header->Flags & FR_IS_DIRECTORY) &&
+            (Standard->FilePermissions & FILE_PERM_READONLY))
+        {
+            Stat->st_mode &= ~(mode_t)0222;
+        }
 
         if (Standard->FilePermissions & FILE_PERM_REPARSE_PT)
         {
@@ -658,18 +969,15 @@ OpenImageWritable(const char* Image,
 }
 
 static void
-DropRecordCache(NtfsFuseState* State)
-{
-    for (auto& Entry : State->RecordCache)
-        NtfsFileRecordDestroy(Entry.second);
-    State->RecordCache.clear();
-}
-
-static void
 CloseImage(NtfsFuseState* State)
 {
+#if NTFSLIB_HAVE_FUSE
+    State->ListedRecords.clear();
+    State->LookupRecord.reset();
+    State->ParentRecord.reset();
+#endif
     State->DirectoryCache.clear();
-    DropRecordCache(State);
+    State->Inodes.clear();
     NtfsVolumeDestroy(State->Volume);
     State->Volume = NULL;
     NtfsDiskCloseLinux();
@@ -3734,875 +4042,3084 @@ Done:
 }
 
 #if NTFSLIB_HAVE_FUSE
+/*
+ * Mounted operation uses the low-level FUSE API with the MFT record number as
+ * the inode number, so every hard link of a file shares one kernel inode and
+ * the kernel can keep entries, attributes and pages cached: every change goes
+ * through this mount. Record 5 (root) and FUSE_ROOT_ID swap numbers. The core
+ * has no internal locking, so the session loop is single-threaded.
+ */
+static const ULONGLONG NtfsRootRecord = 5;
+static const double NtfsFuseCacheTimeout = 86400.0;
+
+static fuse_ino_t
+InoFromReference(ULONGLONG Reference)
+{
+    ULONGLONG Number = Reference & UINT64_C(0x0000FFFFFFFFFFFF);
+
+    if (Number == NtfsRootRecord)
+        return FUSE_ROOT_ID;
+    if (Number == FUSE_ROOT_ID)
+        return (fuse_ino_t)NtfsRootRecord;
+    return (fuse_ino_t)Number;
+}
+
 static NtfsFuseState*
-FuseState(void)
+RequestState(fuse_req_t Request)
 {
-    return (NtfsFuseState*)fuse_get_context()->private_data;
+    return (NtfsFuseState*)fuse_req_userdata(Request);
 }
 
-static void*
-NtfsFuseInit(struct fuse_conn_info* Connection,
-             struct fuse_config* Configuration)
+template<auto Handler, typename... Args>
+static void
+DispatchRequest(fuse_req_t Request, Args... Arguments)
 {
-    NtfsFuseState* State = FuseState();
-
-    /* Readdir stays plain (entry stats are served by getattr through the
-     * kernel attribute cache), so directory listings only carry names.
-     */
-    Connection->want &= ~FUSE_CAP_READDIRPLUS;
-    Connection->want &= ~FUSE_CAP_READDIRPLUS_AUTO;
-    UNREFERENCED_PARAMETER(Configuration);
-    return State;
-}
-
-static int
-NtfsFuseGetattr(const char* Path,
-                struct stat* Stat,
-                struct fuse_file_info* FileInfo)
-{
-    NtfsFuseState* State = FuseState();
-    PNtfsFileRecord File = NULL;
-    NTSTATUS Status;
-
-    /* FileInfo->fh holds a file record for open files but a directory
-     * listing for opendir handles, so always resolve by path.
-     */
-    UNREFERENCED_PARAMETER(FileInfo);
-
-    Status = Lookup(State->Volume, Path, &File);
-    if (!NT_SUCCESS(Status))
-        return -NtStatusToErrno(Status);
-
-    Status = FillStatFromRecord(File, State, Stat);
-    NtfsFileRecordDestroy(File);
-    return NT_SUCCESS(Status) ? 0 : -NtStatusToErrno(Status);
-}
-
-static int
-NtfsFuseReadlink(const char* Path, char* Buffer, size_t Size)
-{
-    PNtfsFileRecord File = NULL;
-    std::string Target;
-    NTSTATUS Status;
-    size_t CopyLength;
-
-    if (Size == 0)
-        return -ERANGE;
-
-    Status = Lookup(FuseState()->Volume, Path, &File);
-    if (NT_SUCCESS(Status))
-        Status = GetReparseTarget(File, Target);
-    NtfsFileRecordDestroy(File);
-    if (!NT_SUCCESS(Status))
-        return -NtStatusToErrno(Status);
-
-    CopyLength = Target.size() < Size - 1 ? Target.size() : Size - 1;
-    memcpy(Buffer, Target.data(), CopyLength);
-    Buffer[CopyLength] = '\0';
-    return 0;
-}
-
-static int
-NtfsFuseAccess(const char* Path, int Mask)
-{
-    PNtfsFileRecord File = NULL;
-    NTSTATUS Status;
-
-    if ((Mask & W_OK) && !FuseState()->Writable)
-        return -EROFS;
-    Status = Lookup(FuseState()->Volume, Path, &File);
-    NtfsFileRecordDestroy(File);
-    return NT_SUCCESS(Status) ? 0 : -NtStatusToErrno(Status);
-}
-
-static PNtfsFileRecord
-HandleRecord(struct fuse_file_info* FileInfo)
-{
-    return (PNtfsFileRecord)(uintptr_t)
-        (FileInfo->fh & ~NTFS_FUSE_CACHED_RECORD_BIT);
-}
-
-static int
-NtfsFuseOpen(const char* Path, struct fuse_file_info* FileInfo)
-{
-    NtfsFuseState* State = FuseState();
-    PNtfsFileRecord File = NULL;
-    PAttribute Data;
-    bool Cached = false;
-    NTSTATUS Status;
-
-    if ((FileInfo->flags & O_ACCMODE) != O_RDONLY &&
-        !State->Writable)
+    int OldCancelState;
+    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &OldCancelState);
     {
-        return -EROFS;
+        std::lock_guard<std::mutex> Guard(RequestState(Request)->RequestLock);
+        Handler(Request, Arguments...);
     }
+    pthread_setcancelstate(OldCancelState, NULL);
+}
 
-    /* Read-only mounts never mutate, so records can be reused across
-     * opens for the mount lifetime. Writable mounts skip the cache: a
-     * path mutation would otherwise have to drop records that open
-     * handles still reference.
-     */
-    if (!State->Writable)
+static void
+WakeWorker(NtfsFuseState* State);
+
+/*
+ * For requests that may free clusters or let a file's cached pages turn dirty: pushed data still on
+ * its way would land on the wrong bytes. The request lock is dropped while waiting, so that a read
+ * the push itself waits on can be answered.
+ */
+template<auto Handler, typename... Args>
+static void
+DispatchMutation(fuse_req_t Request, Args... Arguments)
+{
+    NtfsFuseState* State = RequestState(Request);
+    int OldCancelState;
+
+    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &OldCancelState);
+    for (;;)
     {
-        auto Existing = State->RecordCache.find(Path);
-        if (Existing != State->RecordCache.end())
+        std::unique_lock<std::mutex> Guard(State->RequestLock);
+
+        State->PrefetchGeneration++;
+        if (!State->PrefetchThread.joinable() || State->PrefetchGate.try_lock())
         {
-            File = Existing->second;
-            Cached = true;
-        }
-    }
-    if (!File)
-    {
-        Status = Lookup(State->Volume, Path, &File);
-        if (!NT_SUCCESS(Status))
-            return -NtStatusToErrno(Status);
-    }
-    if (NtfsFileRecordGetHeader(File)->Flags & FR_IS_DIRECTORY)
-    {
-        if (!Cached)
-            NtfsFileRecordDestroy(File);
-        return -EISDIR;
-    }
-
-    Data = NtfsFileRecordGetAttribute(File, TypeData, NULL);
-    if (!Data)
-    {
-        if (!Cached)
-            NtfsFileRecordDestroy(File);
-        return -ENOENT;
-    }
-    if (Data->Flags & ATTR_ENCRYPTED)
-    {
-        if (!Cached)
-            NtfsFileRecordDestroy(File);
-        return -EOPNOTSUPP;
-    }
-
-    if (!State->Writable && !Cached)
-    {
-        State->RecordCache.emplace(Path, File);
-        Cached = true;
-    }
-
-    FileInfo->fh = (uint64_t)(uintptr_t)File;
-    if (Cached)
-        FileInfo->fh |= NTFS_FUSE_CACHED_RECORD_BIT;
-    /* Writable mounts bypass the kernel page/attribute data cache so a
-     * truncate or write through one handle cannot leave stale cached pages
-     * behind another; read-only mounts keep the fast cached path.
-     */
-    if (State->Writable)
-        FileInfo->direct_io = 1;
-    else
-        FileInfo->keep_cache = 1;
-    return 0;
-}
-
-static int
-NtfsFuseRelease(const char* Path, struct fuse_file_info* FileInfo)
-{
-    UNREFERENCED_PARAMETER(Path);
-    if (!(FileInfo->fh & NTFS_FUSE_CACHED_RECORD_BIT))
-        NtfsFileRecordDestroy(HandleRecord(FileInfo));
-    FileInfo->fh = 0;
-    return 0;
-}
-
-static int
-NtfsFuseRead(const char* Path,
-             char* Buffer,
-             size_t Size,
-             off_t Offset,
-             struct fuse_file_info* FileInfo)
-{
-    PNtfsFileRecord File;
-    ULONG Requested;
-    ULONG Remaining;
-    NTSTATUS Status;
-
-    UNREFERENCED_PARAMETER(Path);
-    if (Offset < 0)
-        return -EINVAL;
-    if (Size == 0)
-        return 0;
-
-    File = HandleRecord(FileInfo);
-    if (!File)
-        return -EBADF;
-
-    Requested = Size > MAXULONG ? MAXULONG : (ULONG)Size;
-    Remaining = Requested;
-    Status = NtfsFileRecordCopyData(File,
-                                    TypeData,
-                                    NULL,
-                                    (PUCHAR)Buffer,
-                                    &Remaining,
-                                    (ULONGLONG)Offset);
-    if (Status == STATUS_END_OF_FILE)
-        return 0;
-    if (!NT_SUCCESS(Status))
-        return -NtStatusToErrno(Status);
-    return (int)(Requested - Remaining);
-}
-
-static int
-NtfsFuseOpendir(const char* Path, struct fuse_file_info* FileInfo)
-{
-    NtfsFuseState* State = FuseState();
-    PNtfsFileRecord File = NULL;
-    PNtfsDirectory Directory = NULL;
-    NtfsDirectoryEntry Entry;
-    BOOLEAN Restart = TRUE;
-    NTSTATUS Status;
-    int Result = 0;
-    NtfsDirectoryListing Listing;
-    auto Cached = State->DirectoryCache.find(Path);
-
-    if (Cached == State->DirectoryCache.end())
-    {
-        Status = Lookup(State->Volume, Path, &File);
-        if (!NT_SUCCESS(Status))
-        {
-            Result = -NtStatusToErrno(Status);
-            goto Done;
-        }
-        if (!(NtfsFileRecordGetHeader(File)->Flags & FR_IS_DIRECTORY))
-        {
-            Result = -ENOTDIR;
-            goto Done;
-        }
-
-        Directory = NtfsDirectoryCreate(State->Volume);
-        if (!Directory)
-        {
-            Result = -ENOMEM;
-            goto Done;
-        }
-        Status = NtfsDirectoryLoadDirectory(Directory, File);
-        if (!NT_SUCCESS(Status))
-        {
-            Result = -NtStatusToErrno(Status);
-            goto Done;
-        }
-
-        for (;;)
-        {
-            std::string Name;
-
-            Status = NtfsDirectoryReadNext(Directory, Restart, &Entry);
-            Restart = FALSE;
-            if (Status == STATUS_NO_MORE_FILES)
-                break;
-            if (!NT_SUCCESS(Status))
-            {
-                Result = -NtStatusToErrno(Status);
-                goto Done;
-            }
-            if (!Utf16ToUtf8(Entry.Name, Entry.NameLength, Name))
-            {
-                Result = -EILSEQ;
-                goto Done;
-            }
-            Listing.push_back(std::move(Name));
-        }
-
-        Cached = State->DirectoryCache
-                     .emplace(Path,
-                              std::make_shared<NtfsDirectoryListing>(
-                                  std::move(Listing)))
-                     .first;
-    }
-
-    /* The handle owns a reference to the snapshot, so namespace mutations
-     * can clear the cache without freeing a listing a reader still holds.
-     */
-    FileInfo->fh = (uint64_t)(uintptr_t)
-        new std::shared_ptr<NtfsDirectoryListing>(Cached->second);
-    FileInfo->keep_cache = 1;
-    FileInfo->cache_readdir = 1;
-
-Done:
-    NtfsDirectoryDestroy(Directory);
-    NtfsFileRecordDestroy(File);
-    return Result;
-}
-
-static int
-NtfsFuseReleasedir(const char* Path, struct fuse_file_info* FileInfo)
-{
-    UNREFERENCED_PARAMETER(Path);
-    delete (std::shared_ptr<NtfsDirectoryListing>*)(uintptr_t)FileInfo->fh;
-    FileInfo->fh = 0;
-    return 0;
-}
-
-static int
-NtfsFuseReaddir(const char* Path,
-                void* Buffer,
-                fuse_fill_dir_t Filler,
-                off_t Offset,
-                struct fuse_file_info* FileInfo,
-                enum fuse_readdir_flags Flags)
-{
-    const std::shared_ptr<NtfsDirectoryListing>* Handle =
-        (const std::shared_ptr<NtfsDirectoryListing>*)(uintptr_t)
-            FileInfo->fh;
-    const NtfsDirectoryListing* Listing = Handle ? Handle->get() : NULL;
-    const enum fuse_fill_dir_flags Plain = (enum fuse_fill_dir_flags)0;
-
-    UNREFERENCED_PARAMETER(Path);
-    UNREFERENCED_PARAMETER(Flags);
-
-    if (!Listing || Offset < 0)
-        return -EBADF;
-
-    if (Offset <= 0 &&
-        Filler(Buffer, ".", NULL, 1, Plain) != 0)
-        return 0;
-    if (Offset <= 1 &&
-        Filler(Buffer, "..", NULL, 2, Plain) != 0)
-        return 0;
-
-    for (size_t Index = Offset > 2 ? (size_t)Offset - 2 : 0;
-         Index < Listing->size();
-         Index++)
-    {
-        if (Filler(Buffer,
-                   (*Listing)[Index].c_str(),
-                   NULL,
-                   (off_t)Index + 3,
-                   Plain) != 0)
-        {
+            if (State->PrefetchThread.joinable())
+                State->PrefetchGate.unlock();
+            Handler(Request, Arguments...);
             break;
         }
+        Guard.unlock();
+        WakeWorker(State);
+        std::unique_lock<std::shared_mutex> Wait(State->PrefetchGate);
     }
-
-    return 0;
+    pthread_setcancelstate(OldCancelState, NULL);
 }
 
-static int
-NtfsFuseStatfs(const char* Path, struct statvfs* Stat)
+static PNtfsMasterFileTable
+StateMft(NtfsFuseState* State)
 {
-    NtfsFuseState* State = FuseState();
-    LARGE_INTEGER FreeClusters;
-    NTSTATUS Status;
-
-    UNREFERENCED_PARAMETER(Path);
-    memset(Stat, 0, sizeof(*Stat));
-    Stat->f_bsize =
-        NtfsVolumeGetBytesPerSector(State->Volume) *
-        NtfsVolumeGetSectorsPerCluster(State->Volume);
-    Stat->f_frsize = Stat->f_bsize;
-    Stat->f_blocks = NtfsVolumeGetClustersInVolume(State->Volume);
-    Status = NtfsVolumeGetFreeClusters(State->Volume, &FreeClusters);
-    if (!NT_SUCCESS(Status))
-        return -NtStatusToErrno(Status);
-    Stat->f_bfree = FreeClusters.QuadPart;
-    Stat->f_bavail = FreeClusters.QuadPart;
-    Stat->f_namemax = NTFS_MAX_FILE_NAME_LENGTH;
-    if (!State->Writable)
-        Stat->f_flag = ST_RDONLY;
-    return 0;
+    return NtfsVolumeGetMft(State->Volume);
 }
-
-#ifndef RENAME_NOREPLACE
-#define RENAME_NOREPLACE (1U << 0)
-#endif
-#ifndef RENAME_EXCHANGE
-#define RENAME_EXCHANGE (1U << 1)
-#endif
 
 static UINT64
 TimespecToNtfsTime(const struct timespec* Time)
 {
-    const UINT64 EpochDifference = UINT64_C(116444736000000000);
+    const int64_t EpochSeconds = INT64_C(11644473600);
 
-    return EpochDifference +
-           (UINT64)Time->tv_sec * UINT64_C(10000000) +
-           (UINT64)Time->tv_nsec / 100;
+    if (Time->tv_sec < -EpochSeconds)
+        return 0;
+    if (Time->tv_sec > INT64_MAX / 10000000 - EpochSeconds)
+        return (UINT64)INT64_MAX;
+    UINT64 Ticks = (UINT64)(Time->tv_sec + EpochSeconds) * UINT64_C(10000000) +
+                   (UINT64)Time->tv_nsec / 100;
+    return Ticks > INT64_MAX ? INT64_MAX : Ticks;
 }
 
-/* Namespace mutations drop every cached listing; open directory handles
- * keep their snapshots alive through shared ownership.
+/* A stream that cannot hold holes, neither sparse nor compressed, is never larger than its volume. */
+static bool
+ExceedsVolume(NtfsFuseState* State, PNtfsFileRecord File, ULONGLONG Size)
+{
+    PAttribute Data = NtfsFileRecordGetAttribute(File, TypeData, NULL);
+    NtfsFileBasicInformation Basic = {};
+    NtfsVolumeInformation Information;
+
+    if ((Data && (Data->Flags & (ATTR_SPARSE | ATTR_COMPRESSION_MASK))) ||
+        (NT_SUCCESS(NtfsFileRecordGetBasicInformation(File, &Basic)) &&
+         (Basic.FileAttributes & (FILE_PERM_SPARSE | FILE_PERM_COMPRESSED))))
+    {
+        return false;
+    }
+    return NT_SUCCESS(NtfsVolumeQueryInformation(State->Volume, &Information)) &&
+           Size > Information.TotalClusters * (ULONGLONG)Information.BytesPerCluster;
+}
+
+static bool
+IsReadOnlyFile(PNtfsFileRecord File)
+{
+    NtfsFileBasicInformation Information;
+
+    return !(NtfsFileRecordGetHeader(File)->Flags & FR_IS_DIRECTORY) &&
+           NT_SUCCESS(NtfsFileRecordGetBasicInformation(File, &Information)) &&
+           (Information.FileAttributes & FILE_PERM_READONLY);
+}
+
+static void
+ReplyStatus(fuse_req_t Request, NTSTATUS Status)
+{
+    fuse_reply_err(Request, NT_SUCCESS(Status) ? 0 : NtStatusToErrno(Status));
+}
+
+static NTSTATUS
+FlushPendingWriteTime(NtfsFuseOpenFile* Open)
+{
+    NtfsFileBasicInformation Information;
+    NTSTATUS Status;
+
+    if (!Open || (Open->PendingWriteTime == 0 && Open->PendingAccessTime == 0))
+        return STATUS_SUCCESS;
+    Status = NtfsFileRecordGetBasicInformation(Open->File, &Information);
+    if (NT_SUCCESS(Status))
+    {
+        Information.Fields = 0;
+        if (Open->PendingWriteTime != 0)
+        {
+            Information.Fields |= NTFS_BASIC_INFO_LAST_WRITE_TIME | NTFS_BASIC_INFO_CHANGE_TIME;
+            Information.LastWriteTime = Open->PendingWriteTime;
+            Information.ChangeTime = Open->PendingWriteTime;
+        }
+        if (Open->PendingAccessTime != 0)
+        {
+            Information.Fields |= NTFS_BASIC_INFO_LAST_ACCESS_TIME;
+            Information.LastAccessTime = Open->PendingAccessTime;
+        }
+        Status = NtfsFileRecordSetBasicInformation(Open->File, &Information);
+    }
+    if (NT_SUCCESS(Status))
+        Open->PendingWriteTime = Open->PendingAccessTime = 0;
+    return Status;
+}
+
+static ULONG
+ClusterBytes(NtfsFuseState* State);
+
+static const ULONGLONG NtfsFastWindow = 32u * 1024u * 1024u;
+
+/* Zeroes file bytes [From, To) of a plain stream on the image; the caller holds the request lock. */
+static NTSTATUS
+ZeroDataRange(NtfsFuseState* State, PNtfsFileRecord File, ULONGLONG From, ULONGLONG To)
+{
+    static const UCHAR Zeroes[64 * 1024] = {};
+    ULONG Cluster = ClusterBytes(State);
+
+    while (From < To)
+    {
+        NtfsRetrievalExtent Extent;
+        ULONGLONG Start;
+        ULONG Count = 1;
+        NTSTATUS Status = NtfsFileRecordQueryRetrievalPointers(File, TypeData, NULL, From / Cluster, &Start, &Extent, &Count);
+
+        if ((!NT_SUCCESS(Status) && Status != STATUS_BUFFER_OVERFLOW) || Count != 1 || Extent.Lcn < 0 ||
+            Extent.NextVcn <= From / Cluster)
+        {
+            return NT_SUCCESS(Status) ? STATUS_FILE_CORRUPT_ERROR : Status;
+        }
+        ULONGLONG End = Extent.NextVcn * Cluster < To ? Extent.NextVcn * Cluster : To;
+        ULONGLONG Disk = ((ULONGLONG)Extent.Lcn + (From / Cluster - Start)) * Cluster + From % Cluster;
+
+        while (From < End)
+        {
+            ULONG Chunk = End - From > sizeof(Zeroes) ? (ULONG)sizeof(Zeroes) : (ULONG)(End - From);
+
+            Status = NtfsWriteFileDataLinux(Disk, Zeroes, Chunk);
+            if (!NT_SUCCESS(Status))
+                return Status;
+            From += Chunk;
+            Disk += Chunk;
+        }
+    }
+    return STATUS_SUCCESS;
+}
+
+/*
+ * Waits out the data I/O running outside the request lock, stores the sizes its writes reached and
+ * takes the snapshot down. Every path that uses an open file under the request lock comes through here.
  */
 static void
-InvalidateDirectoryCache(NtfsFuseState* State)
+SettleFast(NtfsFuseState* State, NtfsFuseOpenFile* Open)
 {
-    State->DirectoryCache.clear();
+    NtfsFastFile* Fast = Open->Fast;
+
+    if (!Fast || !Fast->Armed.load(std::memory_order_acquire))
+        return;
+    Fast->Armed.store(false, std::memory_order_release);
+    {
+        std::unique_lock<std::shared_mutex> Guard(Fast->Lock);
+    }
+    if (Fast->Written.exchange(false))
+        Open->Written = true;
+    UINT64 Time = Fast->WriteTime.exchange(0);
+    if (Time > Open->PendingWriteTime)
+        Open->PendingWriteTime = Time;
+
+    NTSTATUS Status = STATUS_SUCCESS;
+    ULONGLONG End = Fast->Frontier;
+
+    for (const auto& Range : Fast->Ahead)
+    {
+        /* Nothing wrote the bytes below this range: they are a hole and read as zero. */
+        if (Range.first > End && NT_SUCCESS(Status))
+        {
+            Status = ZeroDataRange(State, Fast->File, End, Range.first);
+        }
+        if (Range.second > End)
+            End = Range.second;
+    }
+    Fast->Ahead.clear();
+    if (End > Fast->Committed && NT_SUCCESS(Status))
+    {
+        UINT32 Mask = NtfsFileRecordGetAutomaticTimestampMask(Fast->File);
+
+        (void)NtfsFileRecordSetAutomaticTimestampMask(Fast->File, 0);
+        if (End > Fast->DataSize)
+        {
+            PAttribute Data = NtfsFileRecordGetAttribute(Fast->File, TypeData, NULL);
+
+            /* The extents handed out stay allocated: the size moves inside them. */
+            Status = NtfsFileRecordSetWriteSize(Fast->File, TypeData, NULL, End,
+                                                Data && Data->IsNonResident ? Data->NonResident.AllocatedSize : 0);
+        }
+        if (NT_SUCCESS(Status))
+            Status = NtfsFileRecordSetFileValidDataLength(Fast->File, TypeData, NULL, End);
+        (void)NtfsFileRecordSetAutomaticTimestampMask(Fast->File, Mask);
+    }
+    if (!NT_SUCCESS(Status))
+        fprintf(stderr, "ntfslib: storing the written length failed 0x%08" PRIx32 "\n", (uint32_t)Status);
+    Fast->Extents.clear();
 }
 
-static int
-RequireWritable(NtfsFuseState* State)
+/* Snapshots the extents around Offset once a second data request shows the file is being streamed. */
+static void
+ArmFast(NtfsFuseState* State, NtfsFuseOpenFile* Open, ULONGLONG Offset)
 {
-    return State->Writable ? 0 : -EROFS;
+    NtfsFastFile* Fast = Open->Fast;
+    NtfsRetrievalExtent Raw[32];
+    ULONG Count = 32;
+    ULONG Cluster = ClusterBytes(State);
+    ULONGLONG Clusters = NtfsVolumeGetClustersInVolume(State->Volume);
+    ULONGLONG Vcn;
+
+    if (!Fast || ++Open->DataRequests < 2 || Fast->Armed.load(std::memory_order_relaxed))
+        return;
+    PAttribute Data = NtfsFileRecordGetAttribute(Open->File, TypeData, NULL);
+    if (!Data || !Data->IsNonResident || Data->Flags || !Data->NonResident.AllocatedSize ||
+        NtfsFileRecordGetAttribute(Open->File, TypeReparsePoint, NULL))
+    {
+        return;
+    }
+    if (Offset >= Data->NonResident.AllocatedSize)
+        Offset = Data->NonResident.AllocatedSize - 1;
+    NTSTATUS Status = NtfsFileRecordQueryRetrievalPointers(Open->File, TypeData, NULL, Offset / Cluster, &Vcn, Raw, &Count);
+    if ((!NT_SUCCESS(Status) && Status != STATUS_BUFFER_OVERFLOW) || !Count)
+        return;
+    Fast->Extents.clear();
+    for (ULONG Index = 0; Index < Count; Index++)
+    {
+        ULONGLONG Lcn = (ULONGLONG)Raw[Index].Lcn;
+
+        if (Raw[Index].Lcn < 0 || Raw[Index].NextVcn <= Vcn || Lcn >= Clusters ||
+            Raw[Index].NextVcn - Vcn > Clusters - Lcn || Raw[Index].NextVcn > (ULONGLONG)INT64_MAX / Cluster)
+        {
+            break;
+        }
+        Fast->Extents.push_back({Vcn * Cluster, Raw[Index].NextVcn * Cluster, Lcn * Cluster});
+        Vcn = Raw[Index].NextVcn;
+    }
+    if (Fast->Extents.empty())
+        return;
+    Fast->Committed = Data->NonResident.InitalizedDataSize;
+    Fast->DataSize = Data->NonResident.DataSize;
+    Fast->Frontier = Fast->Committed;
+    Fast->ReadOk = !State->Writable || State->NoAtime || Open->AccessChecked;
+    Fast->WriteOk = State->Writable;
+    Fast->SetIdChecked = Open->SetIdChecked;
+    Fast->Armed.store(true, std::memory_order_release);
+}
+
+static const ULONGLONG NtfsPrefetchFileLimit = 128u * 1024u;
+
+static bool
+IsStored(NtfsFuseState* State, fuse_ino_t Ino)
+{
+    std::lock_guard<std::mutex> Guard(State->StoredLock);
+
+    return State->Stored.count(Ino) != 0;
+}
+
+static void
+SetStored(NtfsFuseState* State, fuse_ino_t Ino, bool Stored)
+{
+    std::lock_guard<std::mutex> Guard(State->StoredLock);
+
+    if (Stored)
+        State->Stored.insert(Ino);
+    else
+        State->Stored.erase(Ino);
+}
+
+static NtfsFuseOpenFile*
+FindOpen(NtfsFuseState* State, fuse_ino_t Ino)
+{
+    auto Open = State->OpenFiles.find(Ino);
+
+    if (Open == State->OpenFiles.end())
+        return NULL;
+    SettleFast(State, &Open->second);
+    return &Open->second;
+}
+
+/* FillStatFromRecord plus the write time an open file has not stored yet. */
+static NTSTATUS
+FillInodeStat(NtfsFuseState* State, fuse_ino_t Ino, PNtfsFileRecord File, struct stat* Stat)
+{
+    NtfsFuseOpenFile* Open = FindOpen(State, Ino);
+    NTSTATUS Status = FillStatFromRecord(File, State, Stat);
+
+    if (NT_SUCCESS(Status) && Open && Open->PendingWriteTime != 0)
+    {
+        Stat->st_mtim = NtfsTimeToTimespec(Open->PendingWriteTime);
+        Stat->st_ctim = Stat->st_mtim;
+    }
+    if (NT_SUCCESS(Status) && Open && Open->PendingAccessTime != 0)
+        Stat->st_atim = NtfsTimeToTimespec(Open->PendingAccessTime);
+    else if (NT_SUCCESS(Status) && !State->PendingAccess.empty())
+    {
+        auto Pending = State->PendingAccess.find(NtfsFileRecordGetReference(File));
+
+        if (Pending != State->PendingAccess.end())
+            Stat->st_atim = NtfsTimeToTimespec(Pending->second);
+    }
+    return Status;
+}
+
+/* Counts one kernel lookup of File's inode and fills the reply entry. */
+static NTSTATUS
+RememberEntry(NtfsFuseState* State,
+              PNtfsFileRecord File,
+              struct fuse_entry_param* Entry)
+{
+    ULONGLONG Reference = NtfsFileRecordGetReference(File);
+    NTSTATUS Status;
+
+    memset(Entry, 0, sizeof(*Entry));
+    Status = FillInodeStat(State, InoFromReference(Reference), File, &Entry->attr);
+    if (!NT_SUCCESS(Status))
+        return Status;
+    Entry->ino = InoFromReference(Reference);
+    Entry->generation = Reference >> 48;
+    Entry->attr_timeout = NtfsFuseCacheTimeout;
+    Entry->entry_timeout = NtfsFuseCacheTimeout;
+
+    NtfsFuseInode& Inode = State->Inodes[Entry->ino];
+    Inode.Reference = Reference;
+    Inode.Lookups++;
+    return STATUS_SUCCESS;
+}
+
+/* The record an inode's handles share, or a fresh caller-owned copy. */
+static NTSTATUS
+LoadInode(NtfsFuseState* State,
+          fuse_ino_t Ino,
+          PNtfsFileRecord* File,
+          bool* Owned)
+{
+    auto Open = State->OpenFiles.find(Ino);
+    auto Inode = State->Inodes.find(Ino);
+
+    *File = NULL;
+    *Owned = false;
+    if (Open != State->OpenFiles.end())
+    {
+        SettleFast(State, &Open->second);
+        *File = Open->second.File;
+        return STATUS_SUCCESS;
+    }
+    *Owned = true;
+    if (State->ParentFromLookup && State->ParentRecord && Inode != State->Inodes.end() &&
+        Inode->second.Reference == NtfsFileRecordGetReference(State->ParentRecord.get()) &&
+        State->ParentGeneration == NtfsDiskWriteGenerationLinux())
+    {
+        *File = State->ParentRecord.release();
+        return STATUS_SUCCESS;
+    }
+    if (State->LookupRecord && Inode != State->Inodes.end() &&
+        Inode->second.Reference == NtfsFileRecordGetReference(State->LookupRecord.get()) &&
+        State->LookupGeneration == NtfsDiskWriteGenerationLinux())
+    {
+        *File = State->LookupRecord.release();
+        return STATUS_SUCCESS;
+    }
+    if (!State->ListedRecords.empty() && Inode != State->Inodes.end())
+    {
+        if (State->ListingGeneration != NtfsDiskWriteGenerationLinux())
+            State->ListedRecords.clear();
+        else
+        {
+            auto Record = State->ListedRecords.find(Inode->second.Reference);
+            if (Record != State->ListedRecords.end())
+            {
+                *File = Record->second.release();
+                State->ListedRecords.erase(Record);
+                return STATUS_SUCCESS;
+            }
+        }
+    }
+    if (Inode == State->Inodes.end())
+    {
+        /* A file handle may name an inode the kernel forgot; it checks the generation. */
+        ULONGLONG Number = Ino == FUSE_ROOT_ID ? NtfsRootRecord
+                         : Ino == NtfsRootRecord ? FUSE_ROOT_ID : Ino;
+        std::vector<UCHAR> Record(4096);
+        ULONGLONG Returned = 0;
+        ULONG Length = (ULONG)Record.size();
+        NTSTATUS Status = NtfsMasterFileTableReadFileRecord(StateMft(State), Number, &Returned,
+                                                            Record.data(), &Length);
+
+        if (Status == STATUS_BUFFER_TOO_SMALL)
+        {
+            Record.resize(Length);
+            Status = NtfsMasterFileTableReadFileRecord(StateMft(State), Number, &Returned,
+                                                       Record.data(), &Length);
+        }
+        if (!NT_SUCCESS(Status) || (Returned & UINT64_C(0x0000FFFFFFFFFFFF)) != Number ||
+            ((PFileRecordHeader)Record.data())->BaseFileRecord != 0)
+        {
+            return STATUS_INVALID_HANDLE;
+        }
+        return NtfsMasterFileTableGetFileRecordByReference(
+            StateMft(State),
+            Number | ((ULONGLONG)((PFileRecordHeader)Record.data())->SequenceNumber << 48),
+            File);
+    }
+    return NtfsMasterFileTableGetFileRecordByReference(StateMft(State),
+                                                      Inode->second.Reference,
+                                                      File);
+}
+
+static void
+ReleaseLoaded(PNtfsFileRecord File, bool Owned)
+{
+    if (Owned)
+        NtfsFileRecordDestroy(File);
+}
+
+static bool
+ComponentToNtfs(const char* Name, std::vector<WCHAR>& Output)
+{
+    if (!Utf8ToNtfsString(Name, true, false, Output) || Output.size() < 2)
+        return false;
+    for (WCHAR Character : Output)
+    {
+        if (Character == L'\\')
+            return false;
+    }
+    return true;
+}
+
+/* Resolves Name in Parent with exact case, as Linux NTFS drivers do; the
+ * core matches case-insensitively and still refuses a second name that
+ * differs only in case.
+ */
+static NTSTATUS
+LookupChild(NtfsFuseState* State,
+            PNtfsFileRecord Parent,
+            const std::vector<WCHAR>& Name,
+            PNtfsFileRecord* Child)
+{
+    UNICODE_STRING Requested;
+    UNICODE_STRING Stored;
+    NTSTATUS Status;
+
+    *Child = NULL;
+    if (State->LookupRecord && State->LookupParent == NtfsFileRecordGetReference(Parent) &&
+        Name == State->LookupName && State->LookupGeneration == NtfsDiskWriteGenerationLinux())
+    {
+        *Child = State->LookupRecord.release();
+        return STATUS_SUCCESS;
+    }
+    Status = NtfsMasterFileTableGetFileRecordInDirectory(
+        StateMft(State),
+        Parent,
+        const_cast<PWCHAR>(Name.data()),
+        (ULONG)(Name.size() - 1),
+        Child);
+    if (!NT_SUCCESS(Status))
+        return Status == STATUS_NOT_FOUND ? STATUS_OBJECT_NAME_NOT_FOUND : Status;
+
+    Requested.Buffer = const_cast<PWCHAR>(Name.data());
+    Requested.Length = (USHORT)((Name.size() - 1) * sizeof(WCHAR));
+    Requested.MaximumLength = Requested.Length;
+    Status = NtfsMasterFileTableGetLinkName(StateMft(State),
+                                            *Child,
+                                            NtfsFileRecordGetReference(Parent),
+                                            &Requested,
+                                            &Stored);
+    if (!NT_SUCCESS(Status) ||
+        Stored.Length != Requested.Length ||
+        memcmp(Stored.Buffer, Requested.Buffer, Requested.Length) != 0)
+    {
+        NtfsFileRecordDestroy(*Child);
+        *Child = NULL;
+        return STATUS_OBJECT_NAME_NOT_FOUND;
+    }
+    return STATUS_SUCCESS;
+}
+
+/* Builds the counted path of Name inside the directory Parent. */
+static NTSTATUS
+ChildPath(NtfsFuseState* State,
+          ULONGLONG ParentReference,
+          const std::vector<WCHAR>& Name,
+          std::vector<WCHAR>& Path)
+{
+    ULONG Length = 0;
+    NTSTATUS Status;
+
+    Path.resize(NTFS_MAX_PATH_WCHARS);
+    Status = NtfsMasterFileTableGetPathFromFileReference(StateMft(State),
+                                                         ParentReference,
+                                                         Path.data(),
+                                                         (ULONG)Path.size(),
+                                                         &Length);
+    if (!NT_SUCCESS(Status))
+        return Status;
+    Path.resize(Length);
+    if (Path.back() != L'\\')
+        Path.push_back(L'\\');
+    Path.insert(Path.end(), Name.begin(), Name.end() - 1);
+    return STATUS_SUCCESS;
 }
 
 static NTSTATUS
-CreateNodeByPath(NtfsFuseState* State,
-                 const char* Path,
-                 bool IsDirectory)
+InodePath(NtfsFuseState* State, ULONGLONG Reference, std::vector<WCHAR>& Path)
 {
-    std::vector<WCHAR> NtfsPath;
-    PNtfsFileRecord File = NULL;
+    ULONG Length = 0;
     NTSTATUS Status;
 
-    if (!Utf8ToNtfsPath(Path, NtfsPath) ||
-        NtfsPath.size() < 2 ||
-        NtfsPath.size() - 1 > MAXULONG)
+    Path.resize(NTFS_MAX_PATH_WCHARS);
+    Status = NtfsMasterFileTableGetPathFromFileReference(StateMft(State),
+                                                         Reference,
+                                                         Path.data(),
+                                                         (ULONG)Path.size(),
+                                                         &Length);
+    if (NT_SUCCESS(Status))
+        Path.resize(Length);
+    return Status;
+}
+
+static void
+DropListing(NtfsFuseState* State, fuse_ino_t Directory)
+{
+    State->DirectoryCache.erase(Directory);
+}
+
+/* The core changes names through its own record copies; reload the record
+ * open handles share afterwards.
+ */
+static NTSTATUS
+RefreshOpenFile(NtfsFuseState* State, fuse_ino_t Ino)
+{
+    auto Open = State->OpenFiles.find(Ino);
+    PNtfsFileRecord Fresh = NULL;
+    NTSTATUS Status;
+
+    if (Open == State->OpenFiles.end())
+        return STATUS_SUCCESS;
+    SettleFast(State, &Open->second);
+    Status = NtfsMasterFileTableGetFileRecordByReference(
+        StateMft(State),
+        NtfsFileRecordGetReference(Open->second.File),
+        &Fresh);
+    if (NT_SUCCESS(Status))
+        Status = NtfsFileRecordRefresh(Open->second.File, Fresh);
+    NtfsFileRecordDestroy(Fresh);
+    return Status;
+}
+
+static void
+FlushPendingAccess(NtfsFuseState* State)
+{
+    for (auto& Pending : State->PendingAccess)
     {
-        return STATUS_OBJECT_NAME_INVALID;
+        PNtfsFileRecord File = NULL;
+        NtfsFileBasicInformation Information;
+
+        if (NT_SUCCESS(NtfsMasterFileTableGetFileRecordByReference(StateMft(State), Pending.first, &File)) &&
+            NT_SUCCESS(NtfsFileRecordGetBasicInformation(File, &Information)))
+        {
+            Information.Fields = NTFS_BASIC_INFO_LAST_ACCESS_TIME;
+            Information.LastAccessTime = Pending.second;
+            (void)NtfsFileRecordSetBasicInformation(File, &Information);
+        }
+        NtfsFileRecordDestroy(File);
     }
-    Status = NtfsMasterFileTableCreateFile(
-        NtfsVolumeGetMft(State->Volume),
-        NtfsPath.data(),
-        (ULONG)(NtfsPath.size() - 1),
-        IsDirectory,
-        0,
-        &File);
+    State->PendingAccess.clear();
+}
+
+static ULONG
+ClusterBytes(NtfsFuseState* State)
+{
+    return NtfsVolumeGetBytesPerSector(State->Volume) *
+           NtfsVolumeGetSectorsPerCluster(State->Volume);
+}
+
+static PNtfsFileRecord
+AcquireOpenFile(NtfsFuseState* State, fuse_ino_t Ino, PNtfsFileRecord File)
+{
+    auto Existing = State->OpenFiles.find(Ino);
+
+    if (Existing == State->OpenFiles.end())
+    {
+        auto Pending = State->PendingAccess.find(NtfsFileRecordGetReference(File));
+        UINT64 Accessed = Pending == State->PendingAccess.end() ? 0 : Pending->second;
+        auto Inode = State->Inodes.find(Ino);
+        bool Unlinked = Inode != State->Inodes.end() && Inode->second.Unlinked;
+        auto Added = State->OpenFiles.emplace(Ino, NtfsFuseOpenFile{File, 1u, false, false, Unlinked, 0, Accessed, false, false, NULL, 0});
+        Added.first->second.Fast = new NtfsFastFile;
+        Added.first->second.Fast->File = File;
+        Added.first->second.Fast->Owner = &Added.first->second;
+        if (Pending != State->PendingAccess.end())
+            State->PendingAccess.erase(Pending);
+        if (State->Writable)
+            (void)NtfsFileRecordDeferFileNameUpdates(File, TRUE);
+        return File;
+    }
+    assert(Existing->second.File != File);
+    assert(Existing->second.References != 0);
     NtfsFileRecordDestroy(File);
-    if (NT_SUCCESS(Status))
-        InvalidateDirectoryCache(State);
-    return Status;
+    Existing->second.References++;
+    return Existing->second.File;
 }
 
-static NTSTATUS
-RemoveNodeByPath(NtfsFuseState* State,
-                 const char* Path,
-                 bool IsDirectory)
+static void
+DeleteUnlinkedRecord(NtfsFuseState* State, ULONGLONG Reference)
 {
-    std::vector<WCHAR> NtfsPath;
-    NTSTATUS Status;
+    NTSTATUS Status = NtfsMasterFileTableDeleteUnlinkedFile(StateMft(State), Reference, NULL);
 
-    if (!Utf8ToNtfsPath(Path, NtfsPath) ||
-        NtfsPath.size() < 2 ||
-        NtfsPath.size() - 1 > MAXULONG)
+    if (!NT_SUCCESS(Status))
+        fprintf(stderr, "ntfslib: deleting an unlinked file failed 0x%08" PRIx32 "\n", (uint32_t)Status);
+}
+
+static void
+ReleaseOpenFile(NtfsFuseState* State, fuse_ino_t Ino)
+{
+    auto Existing = State->OpenFiles.find(Ino);
+    PNtfsFileRecord File;
+
+    assert(Existing != State->OpenFiles.end());
+    assert(Existing->second.References != 0);
+    if (--Existing->second.References != 0)
+        return;
+
+    SettleFast(State, &Existing->second);
+    File = Existing->second.File;
+    if (!Existing->second.Unlinked &&
+        Existing->second.PendingWriteTime == 0 &&
+        Existing->second.PendingAccessTime != 0)
     {
-        return STATUS_OBJECT_NAME_INVALID;
+        State->PendingAccess[NtfsFileRecordGetReference(File)] = Existing->second.PendingAccessTime;
+        Existing->second.PendingAccessTime = 0;
+        if (State->PendingAccess.size() > 32768)
+            FlushPendingAccess(State);
     }
-    Status = NtfsMasterFileTableDeleteFile(
-        NtfsVolumeGetMft(State->Volume),
-        NtfsPath.data(),
-        (ULONG)(NtfsPath.size() - 1),
-        IsDirectory);
-    if (NT_SUCCESS(Status))
-        InvalidateDirectoryCache(State);
-    return Status;
-}
-
-static NTSTATUS
-RenameNodeByPath(NtfsFuseState* State,
-                 const char* OldPath,
-                 const char* NewPath)
-{
-    std::vector<WCHAR> OldNtfsPath;
-    std::vector<WCHAR> NewNtfsPath;
-    NTSTATUS Status;
-
-    if (!Utf8ToNtfsPath(OldPath, OldNtfsPath) ||
-        !Utf8ToNtfsPath(NewPath, NewNtfsPath) ||
-        OldNtfsPath.size() < 2 ||
-        NewNtfsPath.size() < 2 ||
-        OldNtfsPath.size() - 1 > MAXULONG ||
-        NewNtfsPath.size() - 1 > MAXULONG)
+    if (!Existing->second.Unlinked)
     {
-        return STATUS_OBJECT_NAME_INVALID;
+        NTSTATUS Status = FlushPendingWriteTime(&Existing->second);
+
+        if (!NT_SUCCESS(Status))
+            fprintf(stderr, "ntfslib: storing the write time failed 0x%08" PRIx32 "\n",
+                    (uint32_t)Status);
     }
-    Status = NtfsMasterFileTableRenameFile(
-        NtfsVolumeGetMft(State->Volume),
-        OldNtfsPath.data(),
-        (ULONG)(OldNtfsPath.size() - 1),
-        NewNtfsPath.data(),
-        (ULONG)(NewNtfsPath.size() - 1));
-    if (NT_SUCCESS(Status))
-        InvalidateDirectoryCache(State);
-    return Status;
+    if (Existing->second.Unlinked)
+    {
+        (void)NtfsFileRecordDeferFileNameUpdates(File, FALSE);
+        if (State->Inodes.find(Ino) == State->Inodes.end())
+            DeleteUnlinkedRecord(State, NtfsFileRecordGetReference(File));
+    }
+    else
+    {
+        PAttribute Data = NtfsFileRecordGetAttribute(File, TypeData, NULL);
+
+        /* FIXME: a KEEP_SIZE reservation made before this open is trimmed with the growth. */
+        if (Existing->second.Written &&
+            !Existing->second.Preallocated &&
+            Data && Data->IsNonResident &&
+            !(Data->Flags & (ATTR_COMPRESSED | ATTR_SPARSE)) &&
+            Data->NonResident.AllocatedSize - Data->NonResident.DataSize >=
+                ClusterBytes(State))
+        {
+            NTSTATUS Status = NtfsFileRecordSetFileAllocationSize(
+                File,
+                TypeData,
+                NULL,
+                Data->NonResident.DataSize);
+
+            if (!NT_SUCCESS(Status))
+                fprintf(stderr, "ntfslib: trimming preallocation failed 0x%08" PRIx32 "\n",
+                        (uint32_t)Status);
+            else if (State->Session)
+                fuse_lowlevel_notify_inval_inode(State->Session, Ino, -1, 0);
+        }
+        NTSTATUS Status = NtfsFileRecordDeferFileNameUpdates(File, FALSE);
+
+        if (!NT_SUCCESS(Status))
+            fprintf(stderr, "ntfslib: updating the file names failed 0x%08" PRIx32 "\n",
+                    (uint32_t)Status);
+    }
+    delete Existing->second.Fast;
+    State->OpenFiles.erase(Existing);
+    NtfsFileRecordDestroy(File);
 }
 
-static int
-NtfsFuseCreate(const char* Path,
-               mode_t Mode,
-               struct fuse_file_info* FileInfo)
+static void
+NtfsLowInit(void* UserData, struct fuse_conn_info* Connection)
 {
-    NtfsFuseState* State = FuseState();
-    NTSTATUS Status;
-    int Result;
+    NtfsFuseState* State = (NtfsFuseState*)UserData;
 
-    UNREFERENCED_PARAMETER(Mode);
-    Result = RequireWritable(State);
-    if (Result != 0)
-        return Result;
-
-    Status = CreateNodeByPath(State, Path, false);
-    if (Status == STATUS_OBJECT_NAME_COLLISION &&
-        !(FileInfo->flags & O_EXCL))
+    Connection->time_gran = 100;
+    Connection->want &= ~FUSE_CAP_ASYNC_DIO;
+    if (Connection->max_background < 64)
     {
+        Connection->max_background = 64;
+        Connection->congestion_threshold = 48;
+    }
+#ifdef FUSE_CAP_OVER_IO_URING
+    State->RingTransport = fuse_get_feature_flag(Connection, FUSE_CAP_OVER_IO_URING);
+#endif
+    long PageSize = sysconf(_SC_PAGESIZE);
+    if (PageSize > 0 && (Connection->capable & FUSE_CAP_SPLICE_WRITE))
+    {
+        Connection->want |= FUSE_CAP_SPLICE_WRITE | (Connection->capable & FUSE_CAP_SPLICE_MOVE);
+        State->SpliceThreshold = 2 * (size_t)PageSize;
+    }
+    if (Connection->capable & FUSE_CAP_NO_OPENDIR_SUPPORT)
+    {
+        Connection->want |= FUSE_CAP_NO_OPENDIR_SUPPORT;
+        State->OpenlessDirectories = true;
+    }
+    if (Connection->capable & FUSE_CAP_READDIRPLUS)
+        Connection->want |= FUSE_CAP_READDIRPLUS;
+    Connection->want &= ~FUSE_CAP_READDIRPLUS_AUTO;
+    if (Connection->capable & FUSE_CAP_CACHE_SYMLINKS)
+        Connection->want |= FUSE_CAP_CACHE_SYMLINKS;
+    if (Connection->capable & FUSE_CAP_EXPORT_SUPPORT)
+        Connection->want |= FUSE_CAP_EXPORT_SUPPORT;
+    /* With v2 the kernel stops asking for security.capability before every write; no security.* xattr is stored. */
+    State->WritebackCache = State->Writable && !State->DirectIo && State->WritebackCache &&
+                            (Connection->capable & FUSE_CAP_WRITEBACK_CACHE);
+    NtfsUseWritebackClockLinux(State->WritebackCache);
+    if (State->Writable && (Connection->capable & FUSE_CAP_HANDLE_KILLPRIV_V2))
+        Connection->want |= FUSE_CAP_HANDLE_KILLPRIV_V2;
+    else if (State->WritebackCache)
+        Connection->want &= ~FUSE_CAP_HANDLE_KILLPRIV;
+    else if (State->Writable && (Connection->capable & FUSE_CAP_HANDLE_KILLPRIV))
+        Connection->want |= FUSE_CAP_HANDLE_KILLPRIV;
+    /* mmap of a direct-I/O file fails with ENODEV unless this capability is granted. */
+#ifdef FUSE_CAP_DIRECT_IO_ALLOW_MMAP
+    if (State->DirectIo && (Connection->capable & FUSE_CAP_DIRECT_IO_ALLOW_MMAP))
+        Connection->want |= FUSE_CAP_DIRECT_IO_ALLOW_MMAP;
+    else
+        State->DirectIo = false;
+#else
+    State->DirectIo = false;
+#endif
+    if (State->WritebackCache)
+    {
+        Connection->want |= FUSE_CAP_WRITEBACK_CACHE;
+    }
+    else
+    {
+        Connection->want &= ~FUSE_CAP_WRITEBACK_CACHE;
+    }
+}
+
+static void
+NtfsLowLookup(fuse_req_t Request, fuse_ino_t ParentIno, const char* Name)
+{
+    NtfsFuseState* State = RequestState(Request);
+    PNtfsFileRecord Parent = NULL;
+    PNtfsFileRecord Child = NULL;
+    std::vector<WCHAR> NtfsName;
+    struct fuse_entry_param Entry;
+    bool Owned;
+    NTSTATUS Status;
+
+    if (strcmp(Name, ".") == 0 || strcmp(Name, "..") == 0)
+    {
+        bool Dot = Name[1] == '\0';
+
+        Status = LoadInode(State, ParentIno, &Parent, &Owned);
+        if (NT_SUCCESS(Status) && !Dot)
+        {
+            ULONG Context = 0;
+            ULONGLONG Above = 0;
+            UNICODE_STRING LinkName;
+
+            if (InoFromReference(NtfsFileRecordGetReference(Parent)) == FUSE_ROOT_ID)
+                Above = NtfsFileRecordGetReference(Parent);
+            else
+                Status = NtfsMasterFileTableEnumerateLinks(StateMft(State), Parent, &Context,
+                                                           &Above, &LinkName);
+            if (NT_SUCCESS(Status))
+                Status = NtfsMasterFileTableGetFileRecordByReference(StateMft(State), Above, &Child);
+        }
+        if (NT_SUCCESS(Status))
+            Status = RememberEntry(State, Dot ? Parent : Child, &Entry);
+        ReleaseLoaded(Parent, Owned);
+        NtfsFileRecordDestroy(Child);
+        if (!NT_SUCCESS(Status))
+            ReplyStatus(Request, Status);
+        else
+            fuse_reply_entry(Request, &Entry);
+        return;
+    }
+    if (!ComponentToNtfs(Name, NtfsName))
+    {
+        fuse_reply_err(Request, strlen(Name) > 255 * 4 ? ENAMETOOLONG : ENOENT);
+        return;
+    }
+    if (NtfsName.size() - 1 > NTFS_MAX_FILE_NAME_LENGTH)
+    {
+        fuse_reply_err(Request, ENAMETOOLONG);
+        return;
+    }
+    Status = LoadInode(State, ParentIno, &Parent, &Owned);
+    if (NT_SUCCESS(Status))
+    {
+        Status = LookupChild(State, Parent, NtfsName, &Child);
+        if (NT_SUCCESS(Status))
+        {
+            State->LookupRecord.reset(Child);
+            State->LookupParent = NtfsFileRecordGetReference(Parent);
+            State->LookupName = std::move(NtfsName);
+            State->LookupGeneration = NtfsDiskWriteGenerationLinux();
+        }
+    }
+    if (Owned && (NT_SUCCESS(Status) || Status == STATUS_OBJECT_NAME_NOT_FOUND) && Parent)
+    {
+        State->ParentRecord.reset(Parent);
+        State->ParentFromLookup = true;
+        State->ParentGeneration = NtfsDiskWriteGenerationLinux();
+    }
+    else
+        ReleaseLoaded(Parent, Owned);
+    if (Status == STATUS_OBJECT_NAME_NOT_FOUND)
+    {
+        memset(&Entry, 0, sizeof(Entry));
+        Entry.entry_timeout = NtfsFuseCacheTimeout;
+        fuse_reply_entry(Request, &Entry);
+        return;
+    }
+    if (NT_SUCCESS(Status))
+    {
+        auto Open = State->OpenFiles.find(InoFromReference(NtfsFileRecordGetReference(Child)));
+
+        if (Open != State->OpenFiles.end())
+            SettleFast(State, &Open->second);
+        Status = RememberEntry(State,
+                               Open != State->OpenFiles.end() ? Open->second.File : Child,
+                               &Entry);
+    }
+    if (!NT_SUCCESS(Status))
+        ReplyStatus(Request, Status);
+    else
+        fuse_reply_entry(Request, &Entry);
+}
+
+static void
+ForgetInode(NtfsFuseState* State, fuse_ino_t Ino, uint64_t Count)
+{
+    auto Inode = State->Inodes.find(Ino);
+
+    if (Ino == FUSE_ROOT_ID || Inode == State->Inodes.end())
+        return;
+    if (Inode->second.Lookups <= Count)
+    {
+        if (Inode->second.Unlinked && State->OpenFiles.find(Ino) == State->OpenFiles.end())
+            DeleteUnlinkedRecord(State, Inode->second.Reference);
+        State->Inodes.erase(Inode);
+        State->DirectoryScans.erase(Ino);
+        SetStored(State, Ino, false);
+    }
+    else
+        Inode->second.Lookups -= Count;
+}
+
+static void
+NtfsLowForget(fuse_req_t Request, fuse_ino_t Ino, uint64_t Count)
+{
+    ForgetInode(RequestState(Request), Ino, Count);
+    fuse_reply_none(Request);
+}
+
+static void
+NtfsLowForgetMulti(fuse_req_t Request, size_t Count, struct fuse_forget_data* Forgets)
+{
+    for (size_t Index = 0; Index < Count; Index++)
+        ForgetInode(RequestState(Request), Forgets[Index].ino, Forgets[Index].nlookup);
+    fuse_reply_none(Request);
+}
+
+static void
+NtfsLowGetattr(fuse_req_t Request, fuse_ino_t Ino, struct fuse_file_info* FileInfo)
+{
+    NtfsFuseState* State = RequestState(Request);
+    PNtfsFileRecord File = NULL;
+    struct stat Stat;
+    bool Owned;
+    NTSTATUS Status;
+
+    UNREFERENCED_PARAMETER(FileInfo);
+    if (State->ParentRecord && Ino == InoFromReference(NtfsFileRecordGetReference(State->ParentRecord.get())) &&
+        State->ParentGeneration == NtfsDiskWriteGenerationLinux())
+    {
+        File = State->ParentRecord.get();
+        Owned = false;
         Status = STATUS_SUCCESS;
     }
-    if (!NT_SUCCESS(Status))
-        return -NtStatusToErrno(Status);
-    return NtfsFuseOpen(Path, FileInfo);
-}
-
-static int
-NtfsFuseMknod(const char* Path, mode_t Mode, dev_t Device)
-{
-    NtfsFuseState* State = FuseState();
-    NTSTATUS Status;
-    int Result;
-
-    UNREFERENCED_PARAMETER(Device);
-    Result = RequireWritable(State);
-    if (Result != 0)
-        return Result;
-    if (!S_ISREG(Mode))
-        return -EOPNOTSUPP;
-
-    Status = CreateNodeByPath(State, Path, false);
-    return NT_SUCCESS(Status) ? 0 : -NtStatusToErrno(Status);
-}
-
-static int
-NtfsFuseMkdir(const char* Path, mode_t Mode)
-{
-    NtfsFuseState* State = FuseState();
-    NTSTATUS Status;
-    int Result;
-
-    UNREFERENCED_PARAMETER(Mode);
-    Result = RequireWritable(State);
-    if (Result != 0)
-        return Result;
-
-    Status = CreateNodeByPath(State, Path, true);
-    return NT_SUCCESS(Status) ? 0 : -NtStatusToErrno(Status);
-}
-
-static int
-NtfsFuseUnlink(const char* Path)
-{
-    NtfsFuseState* State = FuseState();
-    NTSTATUS Status;
-    int Result;
-
-    Result = RequireWritable(State);
-    if (Result != 0)
-        return Result;
-
-    Status = RemoveNodeByPath(State, Path, false);
-    return NT_SUCCESS(Status) ? 0 : -NtStatusToErrno(Status);
-}
-
-static int
-NtfsFuseRmdir(const char* Path)
-{
-    NtfsFuseState* State = FuseState();
-    NTSTATUS Status;
-    int Result;
-
-    Result = RequireWritable(State);
-    if (Result != 0)
-        return Result;
-
-    Status = RemoveNodeByPath(State, Path, true);
-    return NT_SUCCESS(Status) ? 0 : -NtStatusToErrno(Status);
-}
-
-static int
-NtfsFuseRename(const char* OldPath,
-               const char* NewPath,
-               unsigned int Flags)
-{
-    NtfsFuseState* State = FuseState();
-    NTSTATUS Status;
-    int Result;
-
-    Result = RequireWritable(State);
-    if (Result != 0)
-        return Result;
-    if (Flags & RENAME_EXCHANGE)
-        return -EOPNOTSUPP;
-
-    Status = RenameNodeByPath(State, OldPath, NewPath);
-    if (Status == STATUS_OBJECT_NAME_COLLISION &&
-        !(Flags & RENAME_NOREPLACE))
-    {
-        PNtfsFileRecord Target = NULL;
-        NTSTATUS TargetStatus;
-        bool TargetIsDirectory;
-
-        /* POSIX rename replaces an existing destination. Without LFS
-         * transactions the remove and rename publish separately; every
-         * intermediate state stays readable, but the pair is not atomic.
-         */
-        TargetStatus = Lookup(State->Volume, NewPath, &Target);
-        if (NT_SUCCESS(TargetStatus))
-        {
-            TargetIsDirectory =
-                (NtfsFileRecordGetHeader(Target)->Flags &
-                 FR_IS_DIRECTORY) != 0;
-            NtfsFileRecordDestroy(Target);
-            Status = RemoveNodeByPath(State, NewPath, TargetIsDirectory);
-            if (NT_SUCCESS(Status))
-                Status = RenameNodeByPath(State, OldPath, NewPath);
-        }
-    }
-    return NT_SUCCESS(Status) ? 0 : -NtStatusToErrno(Status);
-}
-
-static int
-NtfsFuseLink(const char* ExistingPath, const char* NewPath)
-{
-    NtfsFuseState* State = FuseState();
-    std::vector<WCHAR> ExistingNtfsPath;
-    std::vector<WCHAR> NewNtfsPath;
-    NTSTATUS Status;
-    int Result;
-
-    Result = RequireWritable(State);
-    if (Result != 0)
-        return Result;
-
-    if (!Utf8ToNtfsPath(ExistingPath, ExistingNtfsPath) ||
-        !Utf8ToNtfsPath(NewPath, NewNtfsPath) ||
-        ExistingNtfsPath.size() < 2 ||
-        NewNtfsPath.size() < 2 ||
-        ExistingNtfsPath.size() - 1 > MAXULONG ||
-        NewNtfsPath.size() - 1 > MAXULONG)
-    {
-        return -EINVAL;
-    }
-    Status = NtfsMasterFileTableCreateHardLink(
-        NtfsVolumeGetMft(State->Volume),
-        ExistingNtfsPath.data(),
-        (ULONG)(ExistingNtfsPath.size() - 1),
-        NewNtfsPath.data(),
-        (ULONG)(NewNtfsPath.size() - 1));
+    else
+        Status = LoadInode(State, Ino, &File, &Owned);
     if (NT_SUCCESS(Status))
-        InvalidateDirectoryCache(State);
-    return NT_SUCCESS(Status) ? 0 : -NtStatusToErrno(Status);
-}
-
-static int
-NtfsFuseWrite(const char* Path,
-              const char* Buffer,
-              size_t Size,
-              off_t Offset,
-              struct fuse_file_info* FileInfo)
-{
-    NtfsFuseState* State = FuseState();
-    PNtfsFileRecord File;
-    LARGE_INTEGER ByteOffset;
-    ULONG Length;
-    NTSTATUS Status;
-    int Result;
-
-    UNREFERENCED_PARAMETER(Path);
-    Result = RequireWritable(State);
-    if (Result != 0)
-        return Result;
-    if (Offset < 0)
-        return -EINVAL;
-    if (Size == 0)
-        return 0;
-
-    File = HandleRecord(FileInfo);
-    if (!File)
-        return -EBADF;
-
-    Length = Size > MAXULONG ? MAXULONG : (ULONG)Size;
-    ByteOffset.QuadPart = (LONGLONG)Offset;
-    Status = NtfsFileRecordWriteFileData(
-        File,
-        TypeData,
-        NULL,
-        (PUCHAR)const_cast<char*>(Buffer),
-        &Length,
-        &ByteOffset);
+        Status = FillInodeStat(State, Ino, File, &Stat);
+    ReleaseLoaded(File, Owned);
     if (!NT_SUCCESS(Status))
-        return -NtStatusToErrno(Status);
-    return (int)Length;
-}
-
-static int
-NtfsFuseTruncate(const char* Path,
-                 off_t Size,
-                 struct fuse_file_info* FileInfo)
-{
-    NtfsFuseState* State = FuseState();
-    PNtfsFileRecord File;
-    PNtfsFileRecord Owned = NULL;
-    NTSTATUS Status;
-    int Result;
-
-    Result = RequireWritable(State);
-    if (Result != 0)
-        return Result;
-    if (Size < 0)
-        return -EINVAL;
-
-    if (FileInfo && FileInfo->fh)
     {
-        File = HandleRecord(FileInfo);
+        ReplyStatus(Request, Status);
     }
     else
-    {
-        Status = Lookup(State->Volume, Path, &Owned);
-        if (!NT_SUCCESS(Status))
-            return -NtStatusToErrno(Status);
-        if (NtfsFileRecordGetHeader(Owned)->Flags & FR_IS_DIRECTORY)
-        {
-            NtfsFileRecordDestroy(Owned);
-            return -EISDIR;
-        }
-        File = Owned;
-    }
-
-    Status = NtfsFileRecordSetFileDataSize(File,
-                                           TypeData,
-                                           NULL,
-                                           (ULONGLONG)Size);
-    NtfsFileRecordDestroy(Owned);
-    return NT_SUCCESS(Status) ? 0 : -NtStatusToErrno(Status);
+        fuse_reply_attr(Request, &Stat, NtfsFuseCacheTimeout);
 }
 
-static int
-NtfsFuseFallocate(const char* Path,
-                  int Mode,
-                  off_t Offset,
-                  off_t Length,
-                  struct fuse_file_info* FileInfo)
+static bool
+CallerInGroup(fuse_req_t Request, UINT32 Gid)
 {
-    NtfsFuseState* State = FuseState();
-    PNtfsFileRecord File;
-    PNtfsFileRecord Owned = NULL;
-    struct stat Stat;
-    ULONGLONG Target;
+    gid_t Groups[64];
+    int Count;
+
+    if (fuse_req_ctx(Request)->gid == Gid)
+        return true;
+    Count = fuse_req_getgroups(Request, (int)(sizeof(Groups) / sizeof(Groups[0])), Groups);
+    for (int Index = 0; Index < Count && Index < (int)(sizeof(Groups) / sizeof(Groups[0])); Index++)
+    {
+        if (Groups[Index] == Gid)
+            return true;
+    }
+    return false;
+}
+
+/* The server owns set-id clearing (FUSE_CAP_HANDLE_KILLPRIV) and applies the
+ * Linux rule: an unprivileged change to a regular file drops set-user-ID, and
+ * set-group-ID when the file is group-executable or the caller is outside its
+ * group; chown of any non-directory drops set-user-ID whoever asks. */
+static NTSTATUS
+KillSetIdBits(NtfsFuseState* State,
+              fuse_req_t Request,
+              fuse_ino_t Ino,
+              PNtfsFileRecord File,
+              bool Chown,
+              bool Notify)
+{
+    /* FIXME: libfuse does not pass the caller's capabilities; uid 0 stands for CAP_FSETID. */
+    bool Privileged = fuse_req_ctx(Request)->uid == 0;
+    NtfsPosixMetadata Metadata;
+    UINT32 Mode;
     NTSTATUS Status;
-    int Result;
 
-    Result = RequireWritable(State);
-    if (Result != 0)
-        return Result;
-    if (Mode != 0)
-        return -EOPNOTSUPP;
-    if (Offset < 0 || Length <= 0 ||
-        (uint64_t)Offset > UINT64_MAX - (uint64_t)Length)
+    if (Privileged && !Chown)
+        return STATUS_SUCCESS;
+    ReadPosixMetadata(File, &Metadata);
+    if (!Metadata.HasMode || !(Metadata.Mode & (S_ISUID | S_ISGID)) ||
+        (Chown ? S_ISDIR(Metadata.Mode) : !S_ISREG(Metadata.Mode)))
     {
-        return -EINVAL;
+        return STATUS_SUCCESS;
     }
-    Target = (ULONGLONG)Offset + (ULONGLONG)Length;
-
-    if (FileInfo && FileInfo->fh)
+    Mode = Metadata.Mode & ~(UINT32)S_ISUID;
+    if ((Mode & S_ISGID) &&
+        ((Mode & S_IXGRP) ||
+         (!Privileged && !CallerInGroup(Request, Metadata.HasGid ? Metadata.Gid : State->Group))))
     {
-        File = HandleRecord(FileInfo);
+        Mode &= ~(UINT32)S_ISGID;
     }
-    else
-    {
-        Status = Lookup(State->Volume, Path, &Owned);
-        if (!NT_SUCCESS(Status))
-            return -NtStatusToErrno(Status);
-        File = Owned;
-    }
-
-    /* Preallocation must never shrink the existing reservation, so only
-     * grow the allocation when the requested range exceeds it.
-     */
-    Status = FillStatFromRecord(File, State, &Stat);
-    if (NT_SUCCESS(Status) &&
-        Target > (ULONGLONG)Stat.st_blocks * 512)
-    {
-        Status = NtfsFileRecordSetFileAllocationSize(File,
-                                                     TypeData,
-                                                     NULL,
-                                                     Target);
-    }
-    NtfsFileRecordDestroy(Owned);
-    return NT_SUCCESS(Status) ? 0 : -NtStatusToErrno(Status);
+    if (Mode == Metadata.Mode)
+        return STATUS_SUCCESS;
+    Status = WritePosixMetadata(File, NULL, NULL, &Mode, NULL);
+    if (NT_SUCCESS(Status) && Notify)
+        fuse_lowlevel_notify_inval_inode(State->Session, Ino, -1, 0);
+    return Status;
 }
 
-static int
-NtfsFuseUtimens(const char* Path,
-                const struct timespec Times[2],
-                struct fuse_file_info* FileInfo)
+static void
+NtfsLowSetattr(fuse_req_t Request,
+               fuse_ino_t Ino,
+               struct stat* Attributes,
+               int ToSet,
+               struct fuse_file_info* FileInfo)
 {
-    NtfsFuseState* State = FuseState();
+    NtfsFuseState* State = RequestState(Request);
     PNtfsFileRecord File = NULL;
     NtfsFileBasicInformation Information;
     struct timespec Now;
+    struct stat Stat;
+    bool Owned = false;
+    bool IsDirectory;
     NTSTATUS Status;
-    int Result;
 
-    UNREFERENCED_PARAMETER(FileInfo);
-    Result = RequireWritable(State);
-    if (Result != 0)
-        return Result;
-
-    Status = Lookup(State->Volume, Path, &File);
-    if (!NT_SUCCESS(Status))
-        return -NtStatusToErrno(Status);
-
-    Status = NtfsFileRecordGetBasicInformation(File, &Information);
-    if (NT_SUCCESS(Status))
+    if (!State->Writable)
     {
-        clock_gettime(CLOCK_REALTIME, &Now);
-        if (!Times || Times[0].tv_nsec == UTIME_NOW)
-            Information.LastAccessTime = TimespecToNtfsTime(&Now);
-        else if (Times[0].tv_nsec != UTIME_OMIT)
-            Information.LastAccessTime = TimespecToNtfsTime(&Times[0]);
-        if (!Times || Times[1].tv_nsec == UTIME_NOW)
-            Information.LastWriteTime = TimespecToNtfsTime(&Now);
-        else if (Times[1].tv_nsec != UTIME_OMIT)
-            Information.LastWriteTime = TimespecToNtfsTime(&Times[1]);
-        Information.ChangeTime = TimespecToNtfsTime(&Now);
-        Status = NtfsFileRecordSetBasicInformation(File, &Information);
+        fuse_reply_err(Request, EROFS);
+        return;
     }
-    NtfsFileRecordDestroy(File);
-    return NT_SUCCESS(Status) ? 0 : -NtStatusToErrno(Status);
+    if (FileInfo && FileInfo->fh)
+    {
+        File = ((NtfsFastFile*)(uintptr_t)FileInfo->fh)->File;
+        SettleFast(State, ((NtfsFastFile*)(uintptr_t)FileInfo->fh)->Owner);
+    }
+    else
+    {
+        Status = LoadInode(State, Ino, &File, &Owned);
+        if (!NT_SUCCESS(Status))
+        {
+            ReplyStatus(Request, Status);
+            return;
+        }
+    }
+    IsDirectory = (NtfsFileRecordGetHeader(File)->Flags & FR_IS_DIRECTORY) != 0;
+    if (!IsDirectory && State->WritebackCache && (ToSet & FUSE_SET_ATTR_MTIME) && !(ToSet & FUSE_SET_ATTR_MTIME_NOW))
+    {
+        const struct timespec& Input = Attributes->st_mtim;
+        struct timespec Stored = NtfsTimeToTimespec(TimespecToNtfsTime(&Input));
+        if (Stored.tv_sec != Input.tv_sec || Stored.tv_nsec != Input.tv_nsec / 100 * 100)
+        {
+            Status = FillInodeStat(State, Ino, File, &Stat);
+            if (!NT_SUCCESS(Status) || S_ISREG(Stat.st_mode))
+            {
+                ReleaseLoaded(File, Owned);
+                fuse_reply_err(Request, NT_SUCCESS(Status) ? EOVERFLOW : NtStatusToErrno(Status));
+                return;
+            }
+        }
+    }
+    clock_gettime(CLOCK_REALTIME, &Now);
+    if (ToSet & (FUSE_SET_ATTR_ATIME | FUSE_SET_ATTR_ATIME_NOW))
+    {
+        State->PendingAccess.erase(NtfsFileRecordGetReference(File));
+        if (NtfsFuseOpenFile* Open = FindOpen(State, Ino))
+            Open->PendingAccessTime = 0;
+    }
+    Status = FlushPendingWriteTime(FindOpen(State, Ino));
+
+    if (ToSet & FUSE_SET_ATTR_SIZE)
+    {
+        if (IsDirectory)
+            Status = STATUS_FILE_IS_A_DIRECTORY;
+        else if (!(FileInfo && FileInfo->fh) && IsReadOnlyFile(File))
+            Status = STATUS_ACCESS_DENIED;
+        else if (ExceedsVolume(State, File, (ULONGLONG)Attributes->st_size))
+        {
+            ReleaseLoaded(File, Owned);
+            fuse_reply_err(Request, EFBIG);
+            return;
+        }
+        else
+            Status = NtfsFileRecordSetFileDataSize(File, TypeData, NULL,
+                                                   (ULONGLONG)Attributes->st_size);
+        if (NT_SUCCESS(Status))
+            Status = KillSetIdBits(State, Request, Ino, File, false, false);
+        if (Status == STATUS_ACCESS_DENIED)
+        {
+            ReleaseLoaded(File, Owned);
+            fuse_reply_err(Request, EACCES);
+            return;
+        }
+    }
+    if (NT_SUCCESS(Status) &&
+        (ToSet & (FUSE_SET_ATTR_MODE | FUSE_SET_ATTR_ATIME | FUSE_SET_ATTR_MTIME |
+                  FUSE_SET_ATTR_ATIME_NOW | FUSE_SET_ATTR_MTIME_NOW | FUSE_SET_ATTR_CTIME)))
+    {
+        Status = NtfsFileRecordGetBasicInformation(File, &Information);
+        if (NT_SUCCESS(Status))
+        {
+            const NtfsFileBasicInformation Original = Information;
+            UINT32 Fields = 0;
+
+            if (ToSet & FUSE_SET_ATTR_ATIME_NOW)
+                Information.LastAccessTime = TimespecToNtfsTime(&Now), Fields |= NTFS_BASIC_INFO_LAST_ACCESS_TIME;
+            else if (ToSet & FUSE_SET_ATTR_ATIME)
+                Information.LastAccessTime = TimespecToNtfsTime(&Attributes->st_atim), Fields |= NTFS_BASIC_INFO_LAST_ACCESS_TIME;
+            if (ToSet & FUSE_SET_ATTR_MTIME_NOW)
+                Information.LastWriteTime = TimespecToNtfsTime(&Now), Fields |= NTFS_BASIC_INFO_LAST_WRITE_TIME;
+            else if (ToSet & FUSE_SET_ATTR_MTIME)
+                Information.LastWriteTime = TimespecToNtfsTime(&Attributes->st_mtim), Fields |= NTFS_BASIC_INFO_LAST_WRITE_TIME;
+            if ((ToSet & FUSE_SET_ATTR_MODE) && !IsDirectory)
+            {
+                UINT32 Updated = Information.FileAttributes;
+
+                if ((Attributes->st_mode & 0222) == 0)
+                    Updated |= FILE_PERM_READONLY;
+                else
+                    Updated &= ~(UINT32)FILE_PERM_READONLY;
+                if (Updated != Information.FileAttributes)
+                {
+                    Information.FileAttributes = Updated;
+                    Fields |= NTFS_BASIC_INFO_FILE_ATTRIBUTES;
+                }
+            }
+            if (Fields != 0 || (ToSet & (FUSE_SET_ATTR_CTIME | FUSE_SET_ATTR_MODE)))
+            {
+                Information.ChangeTime = (ToSet & FUSE_SET_ATTR_CTIME)
+                    ? TimespecToNtfsTime(&Attributes->st_ctim)
+                    : TimespecToNtfsTime(&Now);
+                Information.Fields = Fields | NTFS_BASIC_INFO_CHANGE_TIME;
+                if (Information.LastAccessTime != Original.LastAccessTime ||
+                    Information.LastWriteTime != Original.LastWriteTime ||
+                    Information.ChangeTime != Original.ChangeTime ||
+                    Information.FileAttributes != Original.FileAttributes)
+                {
+                    Status = NtfsFileRecordSetBasicInformation(File, &Information);
+                }
+            }
+        }
+    }
+    if (NT_SUCCESS(Status) && (ToSet & (FUSE_SET_ATTR_MODE | FUSE_SET_ATTR_UID | FUSE_SET_ATTR_GID)))
+    {
+        struct stat Current;
+
+        Status = FillStatFromRecord(File, State, &Current);
+        if (NT_SUCCESS(Status))
+        {
+            UINT32 Uid = Attributes->st_uid;
+            UINT32 Gid = Attributes->st_gid;
+            UINT32 Mode = (Current.st_mode & S_IFMT) | (Attributes->st_mode & 07777);
+
+            if ((ToSet & (FUSE_SET_ATTR_UID | FUSE_SET_ATTR_GID)) && !(ToSet & FUSE_SET_ATTR_MODE))
+                Status = KillSetIdBits(State, Request, Ino, File, true, false);
+            if (NT_SUCCESS(Status))
+            {
+                Status = WritePosixMetadata(File,
+                                            (ToSet & FUSE_SET_ATTR_UID) ? &Uid : NULL,
+                                            (ToSet & FUSE_SET_ATTR_GID) ? &Gid : NULL,
+                                            (ToSet & FUSE_SET_ATTR_MODE) ? &Mode : NULL,
+                                            NULL);
+            }
+        }
+        if (NtfsFuseOpenFile* Open = FindOpen(State, Ino))
+            Open->SetIdChecked = false;
+    }
+    if (NT_SUCCESS(Status))
+        Status = FillInodeStat(State, Ino, File, &Stat);
+    ReleaseLoaded(File, Owned);
+    if (!NT_SUCCESS(Status))
+        ReplyStatus(Request, Status);
+    else
+        fuse_reply_attr(Request, &Stat, NtfsFuseCacheTimeout);
 }
 
-/* NTFS has no POSIX mode or ownership bits without an ACL mapping, so
- * these accept and discard the request exactly like NTFS-3G does when no
- * user mapping is configured. Refusing them instead would break common
- * tools such as cp -p and tar.
+static void
+NtfsLowReadlink(fuse_req_t Request, fuse_ino_t Ino)
+{
+    NtfsFuseState* State = RequestState(Request);
+    PNtfsFileRecord File = NULL;
+    std::string Target;
+    bool Owned;
+    NTSTATUS Status;
+
+    Status = LoadInode(State, Ino, &File, &Owned);
+    if (NT_SUCCESS(Status))
+        Status = GetReparseTarget(File, Target);
+    ReleaseLoaded(File, Owned);
+    if (!NT_SUCCESS(Status))
+        ReplyStatus(Request, Status);
+    else
+        fuse_reply_readlink(Request, Target.c_str());
+}
+
+static NTSTATUS
+RemoveChild(NtfsFuseState* State, fuse_ino_t ParentIno, const char* Name, bool IsDirectory);
+
+static void
+ReleaseChangedParent(NtfsFuseState* State, PNtfsFileRecord Parent, bool Owned, NTSTATUS Status)
+{
+    if (Owned && NT_SUCCESS(Status))
+    {
+        State->ParentRecord.reset(Parent);
+        State->ParentFromLookup = false;
+        State->ParentGeneration = NtfsDiskWriteGenerationLinux();
+    }
+    else
+        ReleaseLoaded(Parent, Owned);
+}
+
+/* Creates Name in Parent with the caller's ownership and Mode (type and
+ * permissions); on success Created holds the new record. */
+static NTSTATUS
+CreateChild(NtfsFuseState* State,
+            fuse_req_t Request,
+            fuse_ino_t ParentIno,
+            const char* Name,
+            mode_t Mode,
+            dev_t Device,
+            PNtfsFileRecord* Created)
+{
+    bool IsDirectory = S_ISDIR(Mode);
+    PNtfsFileRecord Parent = NULL;
+    std::vector<WCHAR> NtfsName;
+    bool Owned;
+    NTSTATUS Status;
+
+    *Created = NULL;
+    if (!State->Writable)
+        return STATUS_MEDIA_WRITE_PROTECTED;
+    if (!ComponentToNtfs(Name, NtfsName))
+        return STATUS_OBJECT_NAME_INVALID;
+    if (NtfsName.size() - 1 > NTFS_MAX_FILE_NAME_LENGTH)
+        return STATUS_NAME_TOO_LONG;
+    NtfsPosixMetadata ParentMetadata;
+
+    Status = LoadInode(State, ParentIno, &Parent, &Owned);
+    if (!NT_SUCCESS(Status))
+        return Status;
+    ReadPosixMetadata(Parent, &ParentMetadata);
+
+    const struct fuse_ctx* Context = fuse_req_ctx(Request);
+    UINT32 Uid = Context->uid;
+    UINT32 Gid = Context->gid;
+    UINT32 FullMode = Mode;
+    UINT32 Dev = (UINT32)((major(Device) << 20) | (minor(Device) & 0xFFFFF));
+    NtfsExtendedAttributeUpdate Updates[4];
+
+    /* A set-group-ID directory passes its group on, and the bit to subdirectories. */
+    if (ParentMetadata.HasMode && (ParentMetadata.Mode & S_ISGID))
+    {
+        Gid = ParentMetadata.HasGid ? ParentMetadata.Gid : State->Group;
+        if (IsDirectory)
+            FullMode |= S_ISGID;
+    }
+    ULONG Count = BuildPosixUpdates(Updates, &Uid, &Gid, &FullMode,
+                                    S_ISCHR(Mode) || S_ISBLK(Mode) ? &Dev : NULL);
+
+    /* The kernel looked the name up first; the index insertion still refuses a duplicate. */
+    Status = NtfsMasterFileTableCreateFileWithEas(StateMft(State),
+                                                  Parent,
+                                                  NtfsName.data(),
+                                                  (ULONG)(NtfsName.size() - 1),
+                                                  IsDirectory,
+                                                  0,
+                                                  TRUE,
+                                                  Updates,
+                                                  Count,
+                                                  Created);
+    ReleaseChangedParent(State, Parent, Owned, Status);
+    if (NT_SUCCESS(Status))
+        DropListing(State, ParentIno);
+    return Status;
+}
+
+static void
+ReplyCreatedEntry(fuse_req_t Request, NtfsFuseState* State, PNtfsFileRecord File, NTSTATUS Status)
+{
+    struct fuse_entry_param Entry;
+
+    if (NT_SUCCESS(Status))
+        Status = RememberEntry(State, File, &Entry);
+    NtfsFileRecordDestroy(File);
+    if (!NT_SUCCESS(Status))
+        ReplyStatus(Request, Status);
+    else
+        fuse_reply_entry(Request, &Entry);
+}
+
+static void
+NtfsLowMknod(fuse_req_t Request, fuse_ino_t Parent, const char* Name, mode_t Mode, dev_t Device)
+{
+    NtfsFuseState* State = RequestState(Request);
+    PNtfsFileRecord File = NULL;
+
+    NTSTATUS Status;
+
+    /* FIFOs, sockets and devices are ordinary records typed by $LXMOD, as ntfs3 makes them. */
+    if (!S_ISREG(Mode) && !S_ISFIFO(Mode) && !S_ISSOCK(Mode) && !S_ISCHR(Mode) && !S_ISBLK(Mode))
+    {
+        fuse_reply_err(Request, EOPNOTSUPP);
+        return;
+    }
+    Status = CreateChild(State, Request, Parent, Name, Mode, Device, &File);
+    ReplyCreatedEntry(Request, State, File, Status);
+}
+
+static void
+NtfsLowMkdir(fuse_req_t Request, fuse_ino_t Parent, const char* Name, mode_t Mode)
+{
+    NtfsFuseState* State = RequestState(Request);
+    PNtfsFileRecord File = NULL;
+    NTSTATUS Status;
+
+    Status = CreateChild(State, Request, Parent, Name, S_IFDIR | (Mode & 07777), 0, &File);
+    ReplyCreatedEntry(Request, State, File, Status);
+}
+
+static NTSTATUS
+BuildSymlinkBuffer(const char* Target, std::vector<UCHAR>& Buffer)
+{
+    std::vector<WCHAR> Name;
+    bool Relative = Target[0] != '/';
+    size_t PrefixLength = Relative ? 0 : 4;
+    size_t NameBytes;
+    size_t PrintBytes;
+    size_t SubstituteBytes;
+    UINT32 Tag = NTFS_IO_REPARSE_TAG_SYMLINK;
+    UINT32 Flags = Relative ? NTFS_SYMLINK_FLAG_RELATIVE : 0;
+    UINT16 Field;
+
+    if (!Utf8ToNtfsString(Target, false, false, Name))
+        return STATUS_OBJECT_NAME_INVALID;
+    Name.pop_back();
+    for (WCHAR& Character : Name)
+    {
+        if (Character == L'/')
+            Character = L'\\';
+    }
+    NameBytes = Name.size() * sizeof(WCHAR);
+    SubstituteBytes = PrefixLength * sizeof(WCHAR) + NameBytes;
+    PrintBytes = NameBytes;
+    /* A target too long for both names keeps only the substitute name. */
+    if (8 + 12 + SubstituteBytes + PrintBytes > NTFS_MAXIMUM_REPARSE_DATA_BUFFER_SIZE)
+        PrintBytes = 0;
+    if (8 + 12 + SubstituteBytes + PrintBytes > NTFS_MAXIMUM_REPARSE_DATA_BUFFER_SIZE)
+        return STATUS_NAME_TOO_LONG;
+    Buffer.assign(8 + 12 + SubstituteBytes + PrintBytes, 0);
+    memcpy(&Buffer[0], &Tag, sizeof(Tag));
+    Field = (UINT16)(Buffer.size() - 8);
+    memcpy(&Buffer[4], &Field, sizeof(Field));
+    Field = (UINT16)SubstituteBytes;
+    memcpy(&Buffer[10], &Field, sizeof(Field));
+    memcpy(&Buffer[12], &Field, sizeof(Field));
+    Field = (UINT16)PrintBytes;
+    memcpy(&Buffer[14], &Field, sizeof(Field));
+    memcpy(&Buffer[16], &Flags, sizeof(Flags));
+    if (!Relative)
+        memcpy(&Buffer[20], L"\\??\\", 4 * sizeof(WCHAR));
+    memcpy(&Buffer[20 + PrefixLength * sizeof(WCHAR)], Name.data(), NameBytes);
+    if (PrintBytes != 0)
+        memcpy(&Buffer[20 + SubstituteBytes], Name.data(), PrintBytes);
+    return STATUS_SUCCESS;
+}
+
+static void
+NtfsLowSymlink(fuse_req_t Request, const char* Target, fuse_ino_t Parent, const char* Name)
+{
+    NtfsFuseState* State = RequestState(Request);
+    PNtfsFileRecord File = NULL;
+    std::vector<UCHAR> Buffer;
+    NTSTATUS Status;
+
+    Status = BuildSymlinkBuffer(Target, Buffer);
+    if (NT_SUCCESS(Status))
+        Status = CreateChild(State, Request, Parent, Name, S_IFLNK | 0777, 0, &File);
+    if (NT_SUCCESS(Status))
+    {
+        Status = NtfsFileRecordSetReparsePoint(File, Buffer.data(), (ULONG)Buffer.size());
+        if (!NT_SUCCESS(Status))
+        {
+            NtfsFileRecordDestroy(File);
+            File = NULL;
+            (void)RemoveChild(State, Parent, Name, false);
+        }
+    }
+    ReplyCreatedEntry(Request, State, File, Status);
+}
+
+/* Removes one name. An open file whose last name goes keeps its records
+ * until the last handle closes, as an NT delete-on-close does.
  */
+static NTSTATUS
+RemoveChild(NtfsFuseState* State, fuse_ino_t ParentIno, const char* Name, bool IsDirectory)
+{
+    PNtfsFileRecord Parent = NULL;
+    PNtfsFileRecord Child = NULL;
+    std::vector<WCHAR> NtfsName;
+    BOOLEAN Deleted = FALSE;
+    bool Owned;
+    NTSTATUS Status;
+
+    if (!State->Writable)
+        return STATUS_MEDIA_WRITE_PROTECTED;
+    if (!ComponentToNtfs(Name, NtfsName))
+        return STATUS_OBJECT_NAME_INVALID;
+    Status = LoadInode(State, ParentIno, &Parent, &Owned);
+    if (!NT_SUCCESS(Status))
+        return Status;
+    Status = LookupChild(State, Parent, NtfsName, &Child);
+    if (NT_SUCCESS(Status))
+    {
+        fuse_ino_t ChildIno = InoFromReference(NtfsFileRecordGetReference(Child));
+        auto Open = State->OpenFiles.find(ChildIno);
+        if (Open != State->OpenFiles.end())
+            SettleFast(State, &Open->second);
+        PNtfsFileRecord Canonical = Open != State->OpenFiles.end() ? Open->second.File : NULL;
+        auto Inode = State->Inodes.find(ChildIno);
+        bool KeepRecord = Canonical || Inode != State->Inodes.end();
+
+        Status = NtfsMasterFileTableDeleteChild(StateMft(State),
+                                                Parent,
+                                                Child,
+                                                NtfsName.data(),
+                                                (ULONG)(NtfsName.size() - 1),
+                                                IsDirectory,
+                                                Canonical,
+                                                !KeepRecord,
+                                                KeepRecord,
+                                                &Deleted);
+        if (NT_SUCCESS(Status))
+        {
+            DropListing(State, ParentIno);
+            if (IsDirectory)
+            {
+                DropListing(State, ChildIno);
+                fuse_lowlevel_notify_inval_inode(State->Session, ChildIno, 0, 0);
+            }
+            if (KeepRecord && NtfsFileRecordGetLinkCount(Child) == 0)
+            {
+                if (Canonical)
+                    Open->second.Unlinked = true;
+                if (Inode != State->Inodes.end())
+                    Inode->second.Unlinked = true;
+                State->PendingAccess.erase(NtfsFileRecordGetReference(Child));
+            }
+        }
+    }
+    ReleaseChangedParent(State, Parent, Owned, Status);
+    NtfsFileRecordDestroy(Child);
+    return Status;
+}
+
+static void
+NtfsLowUnlink(fuse_req_t Request, fuse_ino_t Parent, const char* Name)
+{
+    ReplyStatus(Request, RemoveChild(RequestState(Request), Parent, Name, false));
+}
+
+static void
+NtfsLowRmdir(fuse_req_t Request, fuse_ino_t Parent, const char* Name)
+{
+    ReplyStatus(Request, RemoveChild(RequestState(Request), Parent, Name, true));
+}
+
+static void
+NtfsLowRename(fuse_req_t Request,
+              fuse_ino_t OldParentIno,
+              const char* OldName,
+              fuse_ino_t NewParentIno,
+              const char* NewName,
+              unsigned int Flags)
+{
+    NtfsFuseState* State = RequestState(Request);
+    PNtfsFileRecord OldParent = NULL;
+    PNtfsFileRecord NewParent = NULL;
+    PNtfsFileRecord Source = NULL;
+    PNtfsFileRecord Target = NULL;
+    std::vector<WCHAR> OldNtfs;
+    std::vector<WCHAR> NewNtfs;
+    std::vector<WCHAR> OldPath;
+    std::vector<WCHAR> NewPath;
+    bool OldOwned = false;
+    bool NewOwned = false;
+    fuse_ino_t SourceIno = 0;
+    NTSTATUS Status;
+
+    if (!State->Writable)
+    {
+        fuse_reply_err(Request, EROFS);
+        return;
+    }
+    if (Flags & ~(unsigned)RENAME_NOREPLACE)
+    {
+        fuse_reply_err(Request, EINVAL);
+        return;
+    }
+    if (!ComponentToNtfs(OldName, OldNtfs) || !ComponentToNtfs(NewName, NewNtfs))
+    {
+        fuse_reply_err(Request, EINVAL);
+        return;
+    }
+    if (NewNtfs.size() - 1 > NTFS_MAX_FILE_NAME_LENGTH)
+    {
+        fuse_reply_err(Request, ENAMETOOLONG);
+        return;
+    }
+    Status = LoadInode(State, OldParentIno, &OldParent, &OldOwned);
+    if (NT_SUCCESS(Status))
+        Status = LoadInode(State, NewParentIno, &NewParent, &NewOwned);
+    if (NT_SUCCESS(Status))
+        Status = LookupChild(State, OldParent, OldNtfs, &Source);
+    if (NT_SUCCESS(Status))
+    {
+        NTSTATUS TargetStatus = LookupChild(State, NewParent, NewNtfs, &Target);
+
+        if (!NT_SUCCESS(TargetStatus) && TargetStatus != STATUS_OBJECT_NAME_NOT_FOUND)
+            Status = TargetStatus;
+    }
+    if (NT_SUCCESS(Status))
+        Status = ChildPath(State, NtfsFileRecordGetReference(OldParent), OldNtfs, OldPath);
+    if (NT_SUCCESS(Status))
+        Status = ChildPath(State, NtfsFileRecordGetReference(NewParent), NewNtfs, NewPath);
+    ReleaseLoaded(OldParent, OldOwned);
+    ReleaseLoaded(NewParent, NewOwned);
+    if (NT_SUCCESS(Status))
+        SourceIno = InoFromReference(NtfsFileRecordGetReference(Source));
+
+    if (NT_SUCCESS(Status) && Target)
+    {
+        if (NtfsFileRecordGetReference(Target) == NtfsFileRecordGetReference(Source))
+        {
+            /* Two links of one file: POSIX leaves both names in place. */
+            NtfsFileRecordDestroy(Source);
+            NtfsFileRecordDestroy(Target);
+            fuse_reply_err(Request, 0);
+            return;
+        }
+        if (Flags & RENAME_NOREPLACE)
+        {
+            Status = STATUS_OBJECT_NAME_COLLISION;
+        }
+        else
+        {
+            /* FIXME: the replaced name is removed before the rename publishes; not atomic without LFS. */
+            Status = RemoveChild(State,
+                                 NewParentIno,
+                                 NewName,
+                                 (NtfsFileRecordGetHeader(Target)->Flags & FR_IS_DIRECTORY) != 0);
+        }
+    }
+    if (NT_SUCCESS(Status))
+    {
+        Status = NtfsMasterFileTableRenameFile(StateMft(State),
+                                               OldPath.data(),
+                                               (ULONG)OldPath.size(),
+                                               NewPath.data(),
+                                               (ULONG)NewPath.size());
+    }
+    if (NT_SUCCESS(Status))
+    {
+        DropListing(State, OldParentIno);
+        DropListing(State, NewParentIno);
+        if (OldParentIno != NewParentIno && (NtfsFileRecordGetHeader(Source)->Flags & FR_IS_DIRECTORY))
+        {
+            DropListing(State, SourceIno);
+            fuse_lowlevel_notify_inval_inode(State->Session, SourceIno, 0, 0);
+        }
+        Status = RefreshOpenFile(State, SourceIno);
+    }
+    NtfsFileRecordDestroy(Source);
+    NtfsFileRecordDestroy(Target);
+    ReplyStatus(Request, Status);
+}
+
+static void
+NtfsLowLink(fuse_req_t Request, fuse_ino_t Ino, fuse_ino_t NewParentIno, const char* NewName)
+{
+    NtfsFuseState* State = RequestState(Request);
+    PNtfsFileRecord File = NULL;
+    PNtfsFileRecord NewParent = NULL;
+    std::vector<WCHAR> NewNtfs;
+    std::vector<WCHAR> ExistingPath;
+    std::vector<WCHAR> NewPath;
+    bool FileOwned = false;
+    bool ParentOwned = false;
+    NTSTATUS Status;
+
+    if (!State->Writable)
+    {
+        fuse_reply_err(Request, EROFS);
+        return;
+    }
+    if (!ComponentToNtfs(NewName, NewNtfs))
+    {
+        fuse_reply_err(Request, EINVAL);
+        return;
+    }
+    Status = LoadInode(State, Ino, &File, &FileOwned);
+    if (NT_SUCCESS(Status) && (NtfsFileRecordGetHeader(File)->Flags & FR_IS_DIRECTORY))
+        Status = STATUS_FILE_IS_A_DIRECTORY;
+    if (NT_SUCCESS(Status))
+        Status = LoadInode(State, NewParentIno, &NewParent, &ParentOwned);
+    if (NT_SUCCESS(Status))
+        Status = InodePath(State, NtfsFileRecordGetReference(File), ExistingPath);
+    if (NT_SUCCESS(Status))
+        Status = ChildPath(State, NtfsFileRecordGetReference(NewParent), NewNtfs, NewPath);
+    ReleaseLoaded(NewParent, ParentOwned);
+    if (NT_SUCCESS(Status))
+    {
+        Status = NtfsMasterFileTableCreateHardLink(StateMft(State),
+                                                   ExistingPath.data(),
+                                                   (ULONG)ExistingPath.size(),
+                                                   NewPath.data(),
+                                                   (ULONG)NewPath.size());
+    }
+    if (NT_SUCCESS(Status))
+    {
+        DropListing(State, NewParentIno);
+        if (FileOwned)
+        {
+            PNtfsFileRecord Fresh = NULL;
+
+            Status = NtfsMasterFileTableGetFileRecordByReference(
+                StateMft(State), NtfsFileRecordGetReference(File), &Fresh);
+            if (NT_SUCCESS(Status))
+                Status = NtfsFileRecordRefresh(File, Fresh);
+            NtfsFileRecordDestroy(Fresh);
+        }
+        else
+        {
+            Status = RefreshOpenFile(State, Ino);
+        }
+    }
+    if (Status == STATUS_FILE_IS_A_DIRECTORY)
+    {
+        ReleaseLoaded(File, FileOwned);
+        fuse_reply_err(Request, EPERM);
+        return;
+    }
+    if (NT_SUCCESS(Status))
+    {
+        struct fuse_entry_param Entry;
+
+        Status = RememberEntry(State, File, &Entry);
+        ReleaseLoaded(File, FileOwned);
+        if (NT_SUCCESS(Status))
+        {
+            fuse_reply_entry(Request, &Entry);
+            return;
+        }
+    }
+    else
+    {
+        ReleaseLoaded(File, FileOwned);
+    }
+    ReplyStatus(Request, Status);
+}
+
+/* relatime: the access time moves when it is not newer than the last change or is a day old. */
+static bool
+AccessTimeDue(NtfsFuseState* State, NtfsFuseOpenFile* Open, PNtfsFileRecord File, UINT64* Current)
+{
+    const UINT64 Day = UINT64_C(864000000000);
+    NtfsFileBasicInformation Information;
+    struct timespec Now;
+
+    if (!NT_SUCCESS(NtfsFileRecordGetBasicInformation(File, &Information)))
+        return false;
+    UINT64 Accessed = Open->PendingAccessTime ? Open->PendingAccessTime : Information.LastAccessTime;
+    UINT64 Written = Open->PendingWriteTime ? Open->PendingWriteTime : Information.LastWriteTime;
+    UINT64 Changed = Open->PendingWriteTime ? Open->PendingWriteTime : Information.ChangeTime;
+
+    clock_gettime(CLOCK_REALTIME, &Now);
+    *Current = TimespecToNtfsTime(&Now);
+    return State->StrictAtime || Accessed <= Written || Accessed <= Changed || Accessed + Day <= *Current;
+}
+
+static void
+SetOpenCaching(NtfsFuseState* State, fuse_ino_t Ino, NtfsFuseOpenFile* Open, struct fuse_file_info* FileInfo)
+{
+    UINT64 Current;
+
+    if (State->Writable && State->DirectIo)
+        FileInfo->direct_io = 1;
+    /* Cached reads never reach the daemon, so an access time still due needs the first read to. */
+    else if (!State->Writable || State->NoAtime || (FileInfo->flags & O_ACCMODE) == O_WRONLY ||
+             Open->AccessChecked || !AccessTimeDue(State, Open, Open->File, &Current))
+        FileInfo->keep_cache = 1;
+    else if (IsStored(State, Ino))
+    {
+        /* FIXME: an open whose data was pushed ahead takes the access time whether or not it reads. */
+        Open->AccessChecked = true;
+        Open->PendingAccessTime = Current;
+        FileInfo->keep_cache = 1;
+        /* No read will reach the daemon to make the kernel ask for the new time: drop its copy now. */
+        if (State->Session)
+            fuse_lowlevel_notify_inval_inode(State->Session, Ino, -1, 0);
+    }
+}
+
+/* What a small plain file's data is made of: resident bytes, or up to four runs on the image. */
+struct NtfsPrefetchItem
+{
+    fuse_ino_t Ino;
+    ULONG Size;
+    std::vector<UCHAR> Resident;
+    NtfsFastExtent Runs[4];
+    unsigned RunCount;
+};
+
+static bool
+DescribeSmallFile(NtfsFuseState* State, PNtfsFileRecord File, NtfsPrefetchItem* Item)
+{
+    PAttribute Data = NtfsFileRecordGetAttribute(File, TypeData, NULL);
+    ULONG Cluster = ClusterBytes(State);
+    ULONGLONG Clusters = NtfsVolumeGetClustersInVolume(State->Volume);
+
+    if (!Data || Data->Flags || (NtfsFileRecordGetHeader(File)->Flags & FR_IS_DIRECTORY) ||
+        NtfsFileRecordGetAttribute(File, TypeReparsePoint, NULL))
+    {
+        return false;
+    }
+    Item->RunCount = 0;
+    Item->Resident.clear();
+    if (!Data->IsNonResident)
+    {
+        ULONG Length = Data->Resident.DataLength;
+        ULONG Remaining = Length;
+
+        Item->Size = Length;
+        Item->Resident.resize(Length);
+        return Length == 0 ||
+               (NT_SUCCESS(NtfsFileRecordCopyData(File, TypeData, NULL, Item->Resident.data(), &Remaining, 0)) && Remaining == 0);
+    }
+    if (Data->NonResident.DataSize > NtfsPrefetchFileLimit ||
+        Data->NonResident.InitalizedDataSize != Data->NonResident.DataSize)
+    {
+        return false;
+    }
+    Item->Size = (ULONG)Data->NonResident.DataSize;
+    for (ULONGLONG Offset = 0; Offset < Item->Size;)
+    {
+        NtfsRetrievalExtent Extent;
+        ULONGLONG Start;
+        ULONG Count = 1;
+        NTSTATUS Status = NtfsFileRecordQueryRetrievalPointers(File, TypeData, NULL, Offset / Cluster, &Start, &Extent, &Count);
+        ULONGLONG Lcn = (ULONGLONG)Extent.Lcn;
+
+        if ((!NT_SUCCESS(Status) && Status != STATUS_BUFFER_OVERFLOW) || Count != 1 || Extent.Lcn < 0 ||
+            Item->RunCount == 4 || Extent.NextVcn <= Offset / Cluster || Lcn >= Clusters ||
+            Extent.NextVcn - Start > Clusters - Lcn)
+        {
+            return false;
+        }
+        ULONGLONG End = Extent.NextVcn * Cluster < Item->Size ? Extent.NextVcn * Cluster : Item->Size;
+
+        Item->Runs[Item->RunCount++] = {Offset, End, (Lcn + (Offset / Cluster - Start)) * Cluster + Offset % Cluster};
+        Offset = End;
+    }
+    return true;
+}
+
+static bool
+PushSmallFile(NtfsFuseState* State, const NtfsPrefetchItem& Item, std::vector<UCHAR>& Buffer)
+{
+    struct fuse_bufvec Vector = FUSE_BUFVEC_INIT(Item.Size);
+
+    if (Item.Size == 0)
+        return true;
+    if (Item.RunCount == 0)
+        Vector.buf[0].mem = const_cast<UCHAR*>(Item.Resident.data());
+    else
+    {
+        if (Buffer.size() < Item.Size)
+            Buffer.resize(Item.Size);
+        for (unsigned Index = 0; Index < Item.RunCount; Index++)
+        {
+            size_t Length = (size_t)(Item.Runs[Index].End - Item.Runs[Index].Start);
+            size_t Done = 0;
+
+
+            while (Done < Length)
+            {
+                ssize_t Result = pread(NtfsDiskFdLinux(), Buffer.data() + Item.Runs[Index].Start + Done, Length - Done,
+                                       (off_t)(Item.Runs[Index].Disk + Done));
+
+                if (Result < 0 && errno == EINTR)
+                    continue;
+                if (Result <= 0)
+                    return false;
+                Done += (size_t)Result;
+            }
+        }
+        Vector.buf[0].mem = Buffer.data();
+    }
+    return fuse_lowlevel_notify_store(State->Session, Item.Ino, 0, &Vector, (fuse_buf_copy_flags)0) == 0;
+}
+
+/* The first reader of a small file gets its data with the open instead of asking for it afterwards. */
+static void
+StoreAtOpen(NtfsFuseState* State, fuse_ino_t Ino, PNtfsFileRecord File)
+{
+    static std::vector<UCHAR> Buffer;
+    NtfsPrefetchItem Item;
+
+    if (!State->Session || !State->PrefetchThread.joinable() || IsStored(State, Ino))
+        return;
+    Item.Ino = Ino;
+    if (DescribeSmallFile(State, File, &Item) && PushSmallFile(State, Item, Buffer))
+    {
+        SetStored(State, Ino, true);
+    }
+}
+
+static void
+SchedulePrefetch(NtfsFuseState* State, fuse_ino_t Ino)
+{
+    auto Inode = State->Inodes.find(Ino);
+
+    if (!State->PrefetchThread.joinable() || State->DirectIo || Inode == State->Inodes.end() ||
+        !Inode->second.ListDirectory)
+    {
+        return;
+    }
+    auto Cached = State->DirectoryCache.find(Inode->second.ListDirectory);
+    if (Cached == State->DirectoryCache.end())
+        return;
+    const std::shared_ptr<NtfsDirectoryListing>& Listing = Cached->second;
+    size_t Index = Inode->second.ListIndex;
+    size_t From;
+
+    if (Index >= Listing->Entries.size() || Listing->Entries[Index].Reference != Inode->second.Reference)
+        return;
+    if (State->PrefetchStream != Listing.get() || Index >= State->PrefetchNext || Index + 64 < State->PrefetchNext)
+    {
+        State->PrefetchStream = Listing.get();
+        State->PrefetchBatch = 8;
+        From = Index + 1;
+    }
+    else if (Index + State->PrefetchBatch / 2 >= State->PrefetchNext)
+    {
+        if (State->PrefetchBatch < 64)
+            State->PrefetchBatch *= 2;
+        From = State->PrefetchNext;
+    }
+    else
+        return;
+    State->PrefetchNext = From + State->PrefetchBatch < Listing->Entries.size() ? From + State->PrefetchBatch
+                                                                                 : Listing->Entries.size();
+    if (From >= State->PrefetchNext)
+        return;
+    {
+        std::lock_guard<std::mutex> Guard(State->PrefetchLock);
+
+        State->PrefetchListing = Listing;
+        State->PrefetchFrom = From;
+        State->PrefetchTo = State->PrefetchNext;
+        State->PrefetchJobGeneration = State->PrefetchGeneration.load();
+        State->PrefetchPending = true;
+    }
+    State->PrefetchWake.notify_one();
+}
+
+static void
+PrefetchLoop(NtfsFuseState* State)
+{
+    std::vector<NtfsPrefetchItem> Items;
+    std::vector<UCHAR> Buffer;
+
+    for (;;)
+    {
+        std::shared_ptr<NtfsDirectoryListing> Listing;
+        size_t From, To;
+        uint64_t Generation;
+
+        {
+            std::unique_lock<std::mutex> Guard(State->PrefetchLock);
+
+            State->PrefetchWake.wait(Guard, [State] { return State->PrefetchPending || State->WorkerStop.load(); });
+            if (State->WorkerStop.load())
+                return;
+            Listing = std::move(State->PrefetchListing);
+            From = State->PrefetchFrom;
+            To = State->PrefetchTo;
+            Generation = State->PrefetchJobGeneration;
+            State->PrefetchPending = false;
+        }
+        Items.clear();
+        {
+            std::lock_guard<std::mutex> Guard(State->RequestLock);
+            ULONGLONG Total = 0;
+
+            if (Generation != State->PrefetchGeneration.load())
+                continue;
+            for (size_t Index = From; Index < To && Total < 4 * 1024 * 1024; Index++)
+            {
+                const NtfsDirectoryName& Child = Listing->Entries[Index];
+                fuse_ino_t Ino = InoFromReference(Child.Reference);
+                auto Inode = State->Inodes.find(Ino);
+                PNtfsFileRecord File = NULL;
+                NtfsPrefetchItem Item;
+
+                /* Only files the kernel knows, nobody has open and nothing was pushed for. */
+                if (Inode == State->Inodes.end() || Inode->second.Reference != Child.Reference || Inode->second.Unlinked ||
+                    State->OpenFiles.count(Ino) || IsStored(State, Ino) ||
+                    !NT_SUCCESS(NtfsMasterFileTableGetFileRecordByReference(StateMft(State), Child.Reference, &File)))
+                {
+                    continue;
+                }
+                Item.Ino = Ino;
+                if (DescribeSmallFile(State, File, &Item))
+                {
+                    Total += Item.Size;
+                    Items.push_back(std::move(Item));
+                }
+                NtfsFileRecordDestroy(File);
+            }
+            State->PrefetchGate.lock_shared();
+        }
+        for (const NtfsPrefetchItem& Item : Items)
+        {
+            if (Generation != State->PrefetchGeneration.load())
+                break;
+            if (PushSmallFile(State, Item, Buffer))
+            {
+                SetStored(State, Item.Ino, true);
+            }
+        }
+        State->PrefetchGate.unlock_shared();
+    }
+}
+
+/* Shared by open and create; consumes File, or uses the shared record when
+ * File is NULL. */
+static NTSTATUS
+OpenRecord(NtfsFuseState* State,
+           fuse_ino_t Ino,
+           PNtfsFileRecord File,
+           struct fuse_file_info* FileInfo)
+{
+    bool WriteAccess = (FileInfo->flags & O_ACCMODE) != O_RDONLY;
+    NtfsFuseOpenFile* Open = File ? NULL : FindOpen(State, Ino);
+    PNtfsFileRecord Checked = File ? File : Open ? Open->File : NULL;
+    PAttribute Data;
+    NTSTATUS Status = STATUS_SUCCESS;
+
+    if (!Checked)
+        return STATUS_INVALID_HANDLE;
+    Data = NtfsFileRecordGetAttribute(Checked, TypeData, NULL);
+    if (NtfsFileRecordGetHeader(Checked)->Flags & FR_IS_DIRECTORY)
+        Status = STATUS_FILE_IS_A_DIRECTORY;
+    else if (!Data || (Data->Flags & ATTR_ENCRYPTED))
+        Status = Data ? STATUS_EAS_NOT_SUPPORTED : STATUS_OBJECT_NAME_NOT_FOUND;
+    else if (WriteAccess && !State->Writable)
+        Status = STATUS_MEDIA_WRITE_PROTECTED;
+    else if (WriteAccess && IsReadOnlyFile(Checked))
+        Status = STATUS_ACCESS_DENIED;
+    if (!NT_SUCCESS(Status))
+    {
+        NtfsFileRecordDestroy(File);
+        return Status;
+    }
+    if (File)
+    {
+        File = AcquireOpenFile(State, Ino, File);
+    }
+    else
+    {
+        Open->References++;
+        File = Open->File;
+    }
+    if (WriteAccess && (FileInfo->flags & O_TRUNC))
+    {
+        Status = NtfsFileRecordSetFileDataSize(File, TypeData, NULL, 0);
+        if (!NT_SUCCESS(Status))
+        {
+            ReleaseOpenFile(State, Ino);
+            return Status;
+        }
+    }
+    Open = FindOpen(State, Ino);
+    assert(Open && Open->File == File);
+    FileInfo->fh = (uint64_t)(uintptr_t)Open->Fast;
+    SetOpenCaching(State, Ino, Open, FileInfo);
+    return STATUS_SUCCESS;
+}
+
 static int
-NtfsFuseChmod(const char* Path,
+OpenErrno(NTSTATUS Status)
+{
+    if (Status == STATUS_ACCESS_DENIED)
+        return EACCES;
+    if (Status == STATUS_EAS_NOT_SUPPORTED)
+        return EOPNOTSUPP;
+    return NtStatusToErrno(Status);
+}
+
+static void
+NtfsLowOpen(fuse_req_t Request, fuse_ino_t Ino, struct fuse_file_info* FileInfo)
+{
+    NtfsFuseState* State = RequestState(Request);
+    PNtfsFileRecord File = NULL;
+    NTSTATUS Status = STATUS_SUCCESS;
+    bool Reader = (FileInfo->flags & O_ACCMODE) == O_RDONLY && !(FileInfo->flags & O_TRUNC);
+
+    if (!FindOpen(State, Ino))
+    {
+        bool Owned;
+
+        Status = LoadInode(State, Ino, &File, &Owned);
+        assert(!NT_SUCCESS(Status) || Owned);
+        /* Nobody has it open, so the kernel holds no newer pages of it. */
+        if (NT_SUCCESS(Status) && Reader && !State->DirectIo)
+            StoreAtOpen(State, Ino, File);
+    }
+    if (NT_SUCCESS(Status))
+        Status = OpenRecord(State, Ino, File, FileInfo);
+    if (NT_SUCCESS(Status) && Reader)
+        SchedulePrefetch(State, Ino);
+    if (NT_SUCCESS(Status) && (FileInfo->flags & O_TRUNC) &&
+        (FileInfo->flags & O_ACCMODE) != O_RDONLY)
+    {
+        Status = KillSetIdBits(State, Request, Ino, ((NtfsFastFile*)(uintptr_t)FileInfo->fh)->File,
+                               false, true);
+        if (!NT_SUCCESS(Status))
+            ReleaseOpenFile(State, Ino);
+    }
+    if (!NT_SUCCESS(Status))
+        fuse_reply_err(Request, OpenErrno(Status));
+    else
+        fuse_reply_open(Request, FileInfo);
+}
+
+static void
+NtfsLowOpenAny(fuse_req_t Request, fuse_ino_t Ino, struct fuse_file_info* FileInfo)
+{
+    if ((FileInfo->flags & O_ACCMODE) == O_RDONLY && !(FileInfo->flags & O_TRUNC))
+        DispatchRequest<NtfsLowOpen>(Request, Ino, FileInfo);
+    else
+        DispatchMutation<NtfsLowOpen>(Request, Ino, FileInfo);
+}
+
+static void
+NtfsLowCreate(fuse_req_t Request,
+              fuse_ino_t Parent,
+              const char* Name,
               mode_t Mode,
               struct fuse_file_info* FileInfo)
 {
-    UNREFERENCED_PARAMETER(Path);
-    UNREFERENCED_PARAMETER(Mode);
-    UNREFERENCED_PARAMETER(FileInfo);
-    return RequireWritable(FuseState());
+    NtfsFuseState* State = RequestState(Request);
+    PNtfsFileRecord File = NULL;
+    struct fuse_entry_param Entry;
+    fuse_ino_t Ino;
+    NTSTATUS Status;
+
+    Status = CreateChild(State, Request, Parent, Name, S_IFREG | (Mode & 07777), 0, &File);
+    if (!NT_SUCCESS(Status))
+    {
+        ReplyStatus(Request, Status);
+        return;
+    }
+    Ino = InoFromReference(NtfsFileRecordGetReference(File));
+    Status = RememberEntry(State, File, &Entry);
+    if (NT_SUCCESS(Status))
+        Status = OpenRecord(State, Ino, File, FileInfo);
+    else
+        NtfsFileRecordDestroy(File);
+    if (!NT_SUCCESS(Status))
+        fuse_reply_err(Request, OpenErrno(Status));
+    else
+        fuse_reply_create(Request, &Entry, FileInfo);
 }
 
-static int
-NtfsFuseChown(const char* Path,
-              uid_t Owner,
-              gid_t Group,
-              struct fuse_file_info* FileInfo)
+static void
+NtfsLowRelease(fuse_req_t Request, fuse_ino_t Ino, struct fuse_file_info* FileInfo)
 {
-    UNREFERENCED_PARAMETER(Path);
-    UNREFERENCED_PARAMETER(Owner);
-    UNREFERENCED_PARAMETER(Group);
     UNREFERENCED_PARAMETER(FileInfo);
-    return RequireWritable(FuseState());
+    ReleaseOpenFile(RequestState(Request), Ino);
+    fuse_reply_err(Request, 0);
 }
 
-/* Every mutation is synchronous through the shared core and the backing
- * image is a host file, so fsync has nothing left to schedule. flush is
- * deliberately not registered: a no-op hook would still cost one FUSE
- * round trip on every close.
+static PUCHAR
+GetReplyBuffer(fuse_req_t Request, NtfsFuseState* State, size_t Size)
+{
+#ifdef FUSE_CAP_OVER_IO_URING
+    char* Payload;
+    size_t Capacity;
+    if (fuse_req_get_payload(Request, &Payload, &Capacity, NULL) == 0 && Capacity >= Size)
+        return (PUCHAR)Payload;
+#else
+    UNREFERENCED_PARAMETER(Request);
+#endif
+    if (State->ReadBuffer.size() < Size)
+        State->ReadBuffer.resize(Size);
+    return State->ReadBuffer.data();
+}
+
+static bool
+ReplyMappedRead(fuse_req_t Request, NtfsFuseState* State, PNtfsFileRecord File, ULONG Length, ULONGLONG Offset)
+{
+    PAttribute Data = NtfsFileRecordGetAttribute(File, TypeData, NULL);
+    if (!Data || !Data->IsNonResident || Data->Flags ||
+        Offset >= Data->NonResident.DataSize || Offset >= Data->NonResident.InitalizedDataSize ||
+        NtfsFileRecordGetAttribute(File, TypeReparsePoint, NULL))
+        return false;
+
+    if (Length > Data->NonResident.DataSize - Offset)
+        Length = (ULONG)(Data->NonResident.DataSize - Offset);
+    if (Length < State->SpliceThreshold || Length > Data->NonResident.InitalizedDataSize - Offset)
+        return false;
+
+    ULONG Cluster = ClusterBytes(State);
+    ULONGLONG First = Offset / Cluster;
+    ULONGLONG Last = (Offset + Length - 1) / Cluster;
+    ULONGLONG Start;
+    NtfsRetrievalExtent Extent;
+    ULONG Count = 1;
+    NTSTATUS Status = NtfsFileRecordQueryRetrievalPointers(File, TypeData, NULL, First, &Start, &Extent, &Count);
+    if ((!NT_SUCCESS(Status) && Status != STATUS_BUFFER_OVERFLOW) || Count != 1 ||
+        Extent.Lcn < 0 || Start > First || Last >= Extent.NextVcn)
+        return false;
+
+    ULONGLONG Lcn = (ULONGLONG)Extent.Lcn;
+    ULONGLONG Clusters = NtfsVolumeGetClustersInVolume(State->Volume);
+    if (Lcn >= Clusters || Last - Start >= Clusters - Lcn ||
+        Lcn + (Last - Start) > ((ULONGLONG)INT64_MAX - (Cluster - 1)) / Cluster)
+        return false;
+
+    struct fuse_bufvec Reply = FUSE_BUFVEC_INIT(Length);
+    Reply.buf[0].flags = (fuse_buf_flags)(FUSE_BUF_IS_FD | FUSE_BUF_FD_SEEK);
+    Reply.buf[0].fd = NtfsDiskFdLinux();
+    Reply.buf[0].pos = (off_t)((Lcn + (First - Start)) * Cluster + Offset % Cluster);
+    fuse_reply_data(Request, &Reply, FUSE_BUF_SPLICE_MOVE);
+    return true;
+}
+
+static void
+NtfsLowRead(fuse_req_t Request,
+            fuse_ino_t Ino,
+            size_t Size,
+            off_t Offset,
+            struct fuse_file_info* FileInfo)
+{
+    NtfsFuseState* State = RequestState(Request);
+    NtfsFuseOpenFile* Open = ((NtfsFastFile*)(uintptr_t)FileInfo->fh)->Owner;
+    PNtfsFileRecord File = Open->File;
+    ULONG Requested = Size > MAXULONG ? MAXULONG : (ULONG)Size;
+    ULONG Remaining = Requested;
+    NTSTATUS Status;
+
+    UNREFERENCED_PARAMETER(Ino);
+    SettleFast(State, Open);
+    if (State->Writable && !State->NoAtime)
+    {
+        UINT64 Current;
+
+        if (!Open->AccessChecked)
+        {
+            Open->AccessChecked = true;
+            if (AccessTimeDue(State, Open, File, &Current))
+                Open->PendingAccessTime = Current;
+        }
+    }
+    ArmFast(State, Open, (ULONGLONG)Offset);
+    if (State->SpliceThreshold && Requested >= State->SpliceThreshold &&
+        ReplyMappedRead(Request, State, File, Requested, (ULONGLONG)Offset))
+        return;
+    PUCHAR Buffer = GetReplyBuffer(Request, State, Requested);
+    Status = NtfsReadFileLinux(File, Buffer, &Remaining, (ULONGLONG)Offset);
+    if (Status == STATUS_END_OF_FILE)
+        fuse_reply_buf(Request, NULL, 0);
+    else if (!NT_SUCCESS(Status))
+        ReplyStatus(Request, Status);
+    else
+        fuse_reply_buf(Request, (const char*)Buffer, Requested - Remaining);
+}
+
+
+
+static void
+NtfsLowWrite(fuse_req_t Request,
+             fuse_ino_t Ino,
+             const char* Buffer,
+             size_t Size,
+             off_t Offset,
+             struct fuse_file_info* FileInfo)
+{
+    NtfsFuseState* State = RequestState(Request);
+    PNtfsFileRecord File = ((NtfsFastFile*)(uintptr_t)FileInfo->fh)->File;
+    auto Open = State->OpenFiles.find(Ino);
+    LARGE_INTEGER ByteOffset;
+    ULONG Length = Size > MAXULONG ? MAXULONG : (ULONG)Size;
+    NTSTATUS Status;
+
+    if (!State->Writable)
+    {
+        fuse_reply_err(Request, EROFS);
+        return;
+    }
+    if (Open != State->OpenFiles.end())
+        SettleFast(State, &Open->second);
+    ByteOffset.QuadPart = (LONGLONG)Offset;
+    if (Open != State->OpenFiles.end())
+    {
+        UINT32 Mask = NtfsFileRecordGetAutomaticTimestampMask(File);
+        struct timespec Now;
+
+        if (!FileInfo->writepage && !Open->second.SetIdChecked && fuse_req_ctx(Request)->uid != 0)
+        {
+            Status = KillSetIdBits(State, Request, Ino, File, false, true);
+            if (!NT_SUCCESS(Status))
+            {
+                ReplyStatus(Request, Status);
+                return;
+            }
+            Open->second.SetIdChecked = true;
+        }
+        Open->second.Written = true;
+        (void)NtfsFileRecordSetAutomaticTimestampMask(File, 0);
+        Status = NtfsFileRecordWriteFileData(File,
+                                             TypeData,
+                                             NULL,
+                                             (PUCHAR)const_cast<char*>(Buffer),
+                                             &Length,
+                                             &ByteOffset);
+        (void)NtfsFileRecordSetAutomaticTimestampMask(File, Mask);
+        if (NT_SUCCESS(Status) && !FileInfo->writepage)
+        {
+            clock_gettime(CLOCK_REALTIME, &Now);
+            Open->second.PendingWriteTime = TimespecToNtfsTime(&Now);
+        }
+    }
+    else
+    {
+        Status = NtfsFileRecordWriteFileData(File,
+                                             TypeData,
+                                             NULL,
+                                             (PUCHAR)const_cast<char*>(Buffer),
+                                             &Length,
+                                             &ByteOffset);
+    }
+    if (!NT_SUCCESS(Status))
+    {
+        ReplyStatus(Request, Status);
+        return;
+    }
+    if (Open != State->OpenFiles.end())
+        ArmFast(State, &Open->second, (ULONGLONG)Offset);
+    fuse_reply_write(Request, Length);
+}
+
+/* Maps file bytes [Start, End) through the snapshot; false when any part lies outside it. */
+static bool
+MapFast(const NtfsFastFile* Fast, ULONGLONG Start, ULONGLONG End, NtfsFastExtent* Pieces, unsigned* Count)
+{
+    unsigned Capacity = *Count;
+    unsigned Used = 0;
+
+    for (const NtfsFastExtent& Extent : Fast->Extents)
+    {
+        if (Start >= Extent.End)
+            continue;
+        if (Start < Extent.Start || Used == Capacity)
+            return false;
+        ULONGLONG Stop = End < Extent.End ? End : Extent.End;
+
+        Pieces[Used++] = {Start, Stop, Extent.Disk + (Start - Extent.Start)};
+        Start = Stop;
+        if (Start == End)
+        {
+            *Count = Used;
+            return true;
+        }
+    }
+    return false;
+}
+
+static PUCHAR
+FastBuffer(fuse_req_t Request, size_t Size)
+{
+    static thread_local std::vector<UCHAR> Buffer;
+#ifdef FUSE_CAP_OVER_IO_URING
+    char* Payload;
+    size_t Capacity;
+
+    if (fuse_req_get_payload(Request, &Payload, &Capacity, NULL) == 0 && Capacity >= Size)
+        return (PUCHAR)Payload;
+#else
+    UNREFERENCED_PARAMETER(Request);
+#endif
+    if (Buffer.size() < Size)
+        Buffer.resize(Size);
+    return Buffer.data();
+}
+
+static bool
+TryFastRead(fuse_req_t Request, NtfsFuseState* State, NtfsFastFile* Fast, size_t Size, off_t Offset)
+{
+    NtfsFastExtent Pieces[8];
+    unsigned Count = 8;
+
+    if (!Fast->Armed.load(std::memory_order_acquire))
+        return false;
+    std::shared_lock<std::shared_mutex> Guard(Fast->Lock);
+    if (!Fast->Armed.load(std::memory_order_acquire) || !Fast->ReadOk || Offset < 0 || Size == 0 ||
+        (ULONGLONG)Offset >= Fast->DataSize)
+    {
+        return false;
+    }
+    ULONGLONG Start = (ULONGLONG)Offset;
+    ULONGLONG Length = Size < Fast->DataSize - Start ? Size : Fast->DataSize - Start;
+
+    if (Length > Fast->Committed || Start > Fast->Committed - Length || !MapFast(Fast, Start, Start + Length, Pieces, &Count))
+        return false;
+    if (State->SpliceThreshold && Length >= State->SpliceThreshold)
+    {
+        union
+        {
+            struct fuse_bufvec Vector;
+            char Storage[sizeof(struct fuse_bufvec) + 7 * sizeof(struct fuse_buf)];
+        } Reply = {};
+
+        struct fuse_buf* Buffers = Reply.Vector.buf;
+
+        Reply.Vector.count = Count;
+        for (unsigned Index = 0; Index < Count; Index++)
+        {
+            Buffers[Index].size = (size_t)(Pieces[Index].End - Pieces[Index].Start);
+            Buffers[Index].flags = (fuse_buf_flags)(FUSE_BUF_IS_FD | FUSE_BUF_FD_SEEK);
+            Buffers[Index].fd = NtfsDiskFdLinux();
+            Buffers[Index].pos = (off_t)Pieces[Index].Disk;
+        }
+        fuse_reply_data(Request, &Reply.Vector, FUSE_BUF_SPLICE_MOVE);
+        return true;
+    }
+
+    PUCHAR Buffer = FastBuffer(Request, (size_t)Length);
+    size_t Done = 0;
+
+    for (unsigned Index = 0; Index < Count; Index++)
+    {
+        size_t Piece = (size_t)(Pieces[Index].End - Pieces[Index].Start);
+        size_t Read = 0;
+
+        while (Read < Piece)
+        {
+            ssize_t Result = pread(NtfsDiskFdLinux(), Buffer + Done + Read, Piece - Read, (off_t)(Pieces[Index].Disk + Read));
+
+            if (Result < 0 && errno == EINTR)
+                continue;
+            if (Result <= 0)
+            {
+                fuse_reply_err(Request, EIO);
+                return true;
+            }
+            Read += (size_t)Result;
+        }
+        Done += Piece;
+    }
+    fuse_reply_buf(Request, (const char*)Buffer, Done);
+    return true;
+}
+
+static bool
+TryFastWrite(fuse_req_t Request, NtfsFuseState* State, NtfsFastFile* Fast, const char* Buffer, size_t Size, off_t Offset,
+             struct fuse_file_info* FileInfo)
+{
+    NtfsFastExtent Pieces[8];
+    unsigned Count = 8;
+    ULONGLONG Start = (ULONGLONG)Offset;
+    ULONGLONG End = Start + Size;
+    bool Commit = false;
+
+    if (!Fast->Armed.load(std::memory_order_acquire))
+        return false;
+    {
+        std::shared_lock<std::shared_mutex> Guard(Fast->Lock);
+
+        if (!Fast->Armed.load(std::memory_order_acquire) || !Fast->WriteOk || Offset < 0 || Size == 0 || Size > MAXULONG ||
+            (!FileInfo->writepage && !Fast->SetIdChecked && fuse_req_ctx(Request)->uid != 0) ||
+            !MapFast(Fast, Start, End, Pieces, &Count))
+        {
+            return false;
+        }
+        if (End > Fast->Committed)
+        {
+            std::lock_guard<std::mutex> Pending(Fast->PendingLock);
+
+            if (Start > Fast->Frontier && Start - Fast->Frontier > NtfsFastWindow)
+                return false;
+        }
+        for (unsigned Index = 0; Index < Count; Index++)
+        {
+            NTSTATUS Status = NtfsWriteFileDataLinux(Pieces[Index].Disk,
+                                                     (const UCHAR*)Buffer + (Pieces[Index].Start - Start),
+                                                     (ULONG)(Pieces[Index].End - Pieces[Index].Start));
+
+            if (!NT_SUCCESS(Status))
+            {
+                ReplyStatus(Request, Status);
+                return true;
+            }
+        }
+        if (End > Fast->Committed)
+        {
+            std::lock_guard<std::mutex> Pending(Fast->PendingLock);
+
+            if (Start <= Fast->Frontier)
+            {
+                if (End > Fast->Frontier)
+                    Fast->Frontier = End;
+                while (!Fast->Ahead.empty() && Fast->Ahead.front().first <= Fast->Frontier)
+                {
+                    if (Fast->Ahead.front().second > Fast->Frontier)
+                        Fast->Frontier = Fast->Ahead.front().second;
+                    Fast->Ahead.erase(Fast->Ahead.begin());
+                }
+            }
+            else
+            {
+                auto Place = Fast->Ahead.begin();
+
+                while (Place != Fast->Ahead.end() && Place->first < Start)
+                    ++Place;
+                Fast->Ahead.insert(Place, {Start, End});
+            }
+            Commit = Fast->Frontier - Fast->Committed >= 4 * NtfsFastWindow;
+        }
+        Fast->Written.store(true, std::memory_order_relaxed);
+        if (!FileInfo->writepage)
+        {
+            struct timespec Now;
+            UINT64 Previous = Fast->WriteTime.load(std::memory_order_relaxed);
+
+            clock_gettime(CLOCK_REALTIME, &Now);
+            UINT64 Time = TimespecToNtfsTime(&Now);
+            while (Previous < Time && !Fast->WriteTime.compare_exchange_weak(Previous, Time))
+            {
+            }
+        }
+    }
+    if (Commit)
+    {
+        /* Store the length reached so far, so a long stream does not leave it all to the last close. */
+        std::lock_guard<std::mutex> Guard(State->RequestLock);
+
+        SettleFast(State, Fast->Owner);
+        Fast->Owner->DataRequests = 1;
+        ArmFast(State, Fast->Owner, End - 1);
+    }
+    fuse_reply_write(Request, Size);
+    return true;
+}
+
+static void
+NtfsLowReadFast(fuse_req_t Request, fuse_ino_t Ino, size_t Size, off_t Offset, struct fuse_file_info* FileInfo)
+{
+    NtfsFastFile* Fast = (NtfsFastFile*)(uintptr_t)FileInfo->fh;
+    NtfsFuseState* State = RequestState(Request);
+    int OldCancelState;
+    bool Done;
+
+    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &OldCancelState);
+    Done = Fast && TryFastRead(Request, State, Fast, Size, Offset);
+    if (!Done && Fast)
+    {
+        /* Whoever held the request lock may have armed the file again: do not take it down for nothing. */
+        std::unique_lock<std::mutex> Guard(State->RequestLock);
+
+        if (Fast->Armed.load(std::memory_order_acquire))
+        {
+            Guard.unlock();
+            Done = TryFastRead(Request, State, Fast, Size, Offset);
+        }
+    }
+    pthread_setcancelstate(OldCancelState, NULL);
+    if (!Done)
+        DispatchRequest<NtfsLowRead>(Request, Ino, Size, Offset, FileInfo);
+}
+
+static void
+NtfsLowWriteFast(fuse_req_t Request, fuse_ino_t Ino, const char* Buffer, size_t Size, off_t Offset,
+                 struct fuse_file_info* FileInfo)
+{
+    NtfsFastFile* Fast = (NtfsFastFile*)(uintptr_t)FileInfo->fh;
+    NtfsFuseState* State = RequestState(Request);
+    int OldCancelState;
+    bool Done;
+
+    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &OldCancelState);
+    Done = Fast && TryFastWrite(Request, State, Fast, Buffer, Size, Offset, FileInfo);
+    if (!Done && Fast)
+    {
+        std::unique_lock<std::mutex> Guard(State->RequestLock);
+
+        if (Fast->Armed.load(std::memory_order_acquire))
+        {
+            Guard.unlock();
+            Done = TryFastWrite(Request, State, Fast, Buffer, Size, Offset, FileInfo);
+        }
+    }
+    pthread_setcancelstate(OldCancelState, NULL);
+    if (!Done)
+        DispatchRequest<NtfsLowWrite>(Request, Ino, Buffer, Size, Offset, FileInfo);
+}
+
+/*
+ * One thread answers a caller that waits for each reply fastest. When the kernel queues requests
+ * without waiting, as writeback and read-ahead do, helpers drain the queue beside it.
  */
-static int
-NtfsFuseFsync(const char* Path,
-              int DataOnly,
-              struct fuse_file_info* FileInfo)
+static void
+WakeWorker(NtfsFuseState* State)
 {
-    UNREFERENCED_PARAMETER(Path);
+    if (State->WorkersSleeping.load(std::memory_order_relaxed) == 0)
+        return;
+    {
+        std::lock_guard<std::mutex> Guard(State->WorkerLock);
+
+        State->WorkerTokens++;
+    }
+    State->WorkerWake.notify_one();
+}
+
+static bool
+RequestWaiting(struct fuse_session* Session)
+{
+    struct pollfd Poll = {fuse_session_fd(Session), POLLIN, 0};
+
+    return poll(&Poll, 1, 0) > 0 && (Poll.revents & POLLIN);
+}
+
+static void
+WorkerLoop(NtfsFuseState* State)
+{
+    struct fuse_session* Session = State->Session;
+    struct fuse_buf Buffer = {};
+
+    for (;;)
+    {
+        {
+            std::unique_lock<std::mutex> Guard(State->WorkerLock);
+
+            State->WorkersSleeping++;
+            State->WorkerWake.wait(Guard, [State] { return State->WorkerTokens != 0 || State->WorkerStop.load(); });
+            State->WorkersSleeping--;
+            if (State->WorkerStop.load())
+                break;
+            State->WorkerTokens--;
+        }
+        for (unsigned Idle = 0; Idle < 64 && !State->WorkerStop.load() && !fuse_session_exited(Session);)
+        {
+            if (!RequestWaiting(Session))
+            {
+                Idle++;
+                continue;
+            }
+            int Result = fuse_session_receive_buf(Session, &Buffer);
+
+            if (Result == -EINTR || Result == -EAGAIN)
+                continue;
+            if (Result <= 0)
+                break;
+            Idle = 0;
+            if (RequestWaiting(Session))
+                WakeWorker(State);
+            fuse_session_process_buf(Session, &Buffer);
+        }
+    }
+    free(Buffer.mem);
+    State->WorkersDone++;
+}
+
+static void
+WakeBlockedWorker(int Signal)
+{
+    UNREFERENCED_PARAMETER(Signal);
+}
+
+/* A helper that lost the race for a request sits in read(): a signal brings it back to look at the stop flag. */
+static void
+StopWorkers(NtfsFuseState* State)
+{
+    struct sigaction Action = {};
+
+    Action.sa_handler = WakeBlockedWorker;
+    sigaction(SIGUSR2, &Action, NULL);
+    State->WorkerStop.store(true);
+    while (State->WorkersDone.load() < State->Workers.size())
+    {
+        State->WorkerWake.notify_all();
+        for (std::thread& Worker : State->Workers)
+            pthread_kill(Worker.native_handle(), SIGUSR2);
+        usleep(1000);
+    }
+    for (std::thread& Worker : State->Workers)
+        Worker.join();
+    State->Workers.clear();
+    {
+        std::lock_guard<std::mutex> Guard(State->PrefetchLock);
+    }
+    State->PrefetchWake.notify_all();
+    if (State->PrefetchThread.joinable())
+        State->PrefetchThread.join();
+}
+
+/*
+ * The kernel lets a FUSE mount hold 1% of the dirty memory, which paces writers below what the
+ * daemon can take. A privileged mount gets the share of any other filesystem; without the
+ * privilege the write fails and the default stays.
+ */
+static void
+RaiseDirtyShare(const char* Mountpoint)
+{
+    char* Resolved = realpath(Mountpoint, NULL);
+    FILE* Mounts = fopen("/proc/self/mountinfo", "r");
+    char Line[4096];
+    char Device[64] = "";
+
+    while (Resolved && Mounts && fgets(Line, sizeof(Line), Mounts))
+    {
+        char Found[64];
+        char Path[2048];
+
+        if (sscanf(Line, "%*u %*u %63s %*s %2047s", Found, Path) == 2 && strcmp(Path, Resolved) == 0)
+            snprintf(Device, sizeof(Device), "%s", Found);
+    }
+    if (Mounts)
+        fclose(Mounts);
+    free(Resolved);
+    if (Device[0])
+    {
+        char Name[128];
+
+        snprintf(Name, sizeof(Name), "/sys/class/bdi/%s/max_ratio", Device);
+        int File = open(Name, O_WRONLY | O_CLOEXEC);
+
+        if (File >= 0)
+        {
+            (void)!write(File, "100", 3);
+            close(File);
+        }
+    }
+}
+
+static int
+SessionLoop(NtfsFuseState* State)
+{
+    struct fuse_session* Session = State->Session;
+    struct fuse_buf Buffer = {};
+    unsigned Interval = 1;
+    unsigned Seen = 0;
+    int Result = 0;
+
+    while (!fuse_session_exited(Session))
+    {
+        Result = fuse_session_receive_buf(Session, &Buffer);
+        if (Result == -EINTR)
+            continue;
+        if (Result <= 0)
+            break;
+        if (!State->Workers.empty() && Buffer.size >= 8 && !(Buffer.flags & FUSE_BUF_IS_FD))
+        {
+            uint32_t Opcode;
+
+            memcpy(&Opcode, (const char*)Buffer.mem + 4, sizeof(Opcode));
+            /* FUSE_READ and FUSE_WRITE; a lone caller's requests never find another one waiting. */
+            if ((Opcode == 15 || Opcode == 16) && ++Seen >= Interval)
+            {
+                Seen = 0;
+                if (RequestWaiting(Session))
+                {
+                    Interval = 1;
+                    WakeWorker(State);
+                }
+                else if (Interval < 16)
+                    Interval *= 2;
+            }
+        }
+        fuse_session_process_buf(Session, &Buffer);
+    }
+    free(Buffer.mem);
+    return Result < 0 ? Result : 0;
+}
+
+static void
+NtfsLowFsync(fuse_req_t Request, fuse_ino_t Ino, int DataOnly, struct fuse_file_info* FileInfo)
+{
+    NtfsFuseState* State = RequestState(Request);
+    NTSTATUS Status = STATUS_SUCCESS;
+
     UNREFERENCED_PARAMETER(DataOnly);
     UNREFERENCED_PARAMETER(FileInfo);
-    return 0;
+    if (State->Writable)
+    {
+        NtfsFuseOpenFile* Open = FindOpen(State, Ino);
+
+        Status = FlushPendingWriteTime(Open);
+        if (NT_SUCCESS(Status) && Open)
+            Status = NtfsFileRecordFlushFileNameUpdates(Open->File);
+        if (NT_SUCCESS(Status))
+            Status = NtfsFlushVolumeContext(NULL);
+    }
+    ReplyStatus(Request, Status);
+}
+
+static void
+NtfsLowFallocate(fuse_req_t Request,
+                 fuse_ino_t Ino,
+                 int Mode,
+                 off_t Offset,
+                 off_t Length,
+                 struct fuse_file_info* FileInfo)
+{
+    NtfsFuseState* State = RequestState(Request);
+    PNtfsFileRecord File = ((NtfsFastFile*)(uintptr_t)FileInfo->fh)->File;
+    auto Open = State->OpenFiles.find(Ino);
+    PAttribute Data;
+    ULONGLONG Target;
+    NTSTATUS Status = STATUS_SUCCESS;
+
+    if (!State->Writable)
+    {
+        fuse_reply_err(Request, EROFS);
+        return;
+    }
+    if (Open != State->OpenFiles.end())
+        SettleFast(State, &Open->second);
+    /* TODO: FALLOC_FL_PUNCH_HOLE and FALLOC_FL_ZERO_RANGE through the core's zero-data range. */
+    if (Mode & ~FALLOC_FL_KEEP_SIZE)
+    {
+        fuse_reply_err(Request, EOPNOTSUPP);
+        return;
+    }
+    if (Offset < 0 || Length <= 0 || (uint64_t)Offset > UINT64_MAX - (uint64_t)Length)
+    {
+        fuse_reply_err(Request, EINVAL);
+        return;
+    }
+    Status = KillSetIdBits(State, Request, Ino, File, false, true);
+    if (!NT_SUCCESS(Status))
+    {
+        ReplyStatus(Request, Status);
+        return;
+    }
+    Target = (ULONGLONG)Offset + (ULONGLONG)Length;
+    Data = NtfsFileRecordGetAttribute(File, TypeData, NULL);
+    if (Mode & FALLOC_FL_KEEP_SIZE)
+    {
+        if (Open != State->OpenFiles.end())
+            Open->second.Preallocated = true;
+        if (!Data || Target > (Data->IsNonResident ? Data->NonResident.AllocatedSize : 0))
+            Status = NtfsFileRecordSetFileAllocationSize(File, TypeData, NULL, Target);
+    }
+    else if (Target > AttributeSize(Data))
+    {
+        /* FIXME: holes of a sparse file stay unallocated, here and below EOF. */
+        Status = NtfsFileRecordSetFileDataSize(File, TypeData, NULL, Target);
+    }
+    ReplyStatus(Request, Status);
+}
+
+static NTSTATUS
+AppendDirectoryName(void* Context, ULONGLONG Reference, const FileNameEx* Entry)
+{
+    auto* Listing = static_cast<NtfsDirectoryListing*>(Context);
+    std::string Name;
+    mode_t Type = 0;
+
+    if (!Utf16ToUtf8(Entry->Name, Entry->NameLength, Name))
+        return STATUS_OBJECT_NAME_INVALID;
+    if (Entry->Flags & FILE_PERM_REPARSE_PT)
+    {
+        if (Entry->Extended.ReparseTag == NTFS_IO_REPARSE_TAG_WOF)
+            Type = Entry->Flags & FN_DIRECTORY ? S_IFDIR : S_IFREG;
+    }
+    else if (Entry->Flags & FN_DIRECTORY)
+        Type = S_IFDIR;
+    else if (!Entry->Extended.EAInfo.PackedEASize)
+        Type = S_IFREG;
+    Listing->Entries.push_back({std::move(Name), Reference, Type});
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+GetListing(NtfsFuseState* State, fuse_ino_t Ino, std::shared_ptr<NtfsDirectoryListing>& Result)
+{
+    auto Cached = State->DirectoryCache.find(Ino);
+
+    if (Cached == State->DirectoryCache.end())
+    {
+        auto Inode = State->Inodes.find(Ino);
+        if (Inode != State->Inodes.end() && Inode->second.Unlinked)
+        {
+            Result.reset();
+            return STATUS_SUCCESS;
+        }
+        PNtfsFileRecord File = NULL;
+        NtfsDirectoryListing Listing;
+        bool Owned;
+        NTSTATUS Status;
+
+        Status = LoadInode(State, Ino, &File, &Owned);
+        if (NT_SUCCESS(Status) && !(NtfsFileRecordGetHeader(File)->Flags & FR_IS_DIRECTORY))
+            Status = STATUS_NOT_A_DIRECTORY;
+        if (NT_SUCCESS(Status))
+        {
+            ULONG Context = 0;
+            ULONGLONG ParentReference = 0;
+            UNICODE_STRING LinkName;
+
+            Listing.Self = NtfsFileRecordGetReference(File);
+            Listing.Parent = Listing.Self;
+            if (InoFromReference(Listing.Self) != FUSE_ROOT_ID &&
+                NT_SUCCESS(NtfsMasterFileTableEnumerateLinks(StateMft(State), File, &Context,
+                                                             &ParentReference, &LinkName)))
+            {
+                Listing.Parent = ParentReference;
+            }
+            Status = NtfsDirectoryVisitNames(State->Volume, File, AppendDirectoryName, &Listing);
+        }
+        ReleaseLoaded(File, Owned);
+        if (!NT_SUCCESS(Status))
+            return Status;
+        Cached = State->DirectoryCache
+                     .emplace(Ino, std::make_shared<NtfsDirectoryListing>(std::move(Listing)))
+                     .first;
+    }
+    Result = Cached->second;
+    return STATUS_SUCCESS;
+}
+
+static void
+NtfsLowOpendir(fuse_req_t Request, fuse_ino_t Ino, struct fuse_file_info* FileInfo)
+{
+    NtfsFuseState* State = RequestState(Request);
+    std::shared_ptr<NtfsDirectoryListing> Listing;
+    NTSTATUS Status;
+
+    /* The kernel then stops asking: a directory costs no open and no release. */
+    if (State->OpenlessDirectories)
+    {
+        fuse_reply_err(Request, ENOSYS);
+        return;
+    }
+    Status = GetListing(State, Ino, Listing);
+    if (!NT_SUCCESS(Status))
+    {
+        fuse_reply_err(Request, Status == STATUS_OBJECT_NAME_INVALID ? EILSEQ
+                                                                     : NtStatusToErrno(Status));
+        return;
+    }
+    FileInfo->keep_cache = 1;
+    FileInfo->cache_readdir = 1;
+    fuse_reply_open(Request, FileInfo);
+}
+
+static void
+NtfsLowReleasedir(fuse_req_t Request, fuse_ino_t Ino, struct fuse_file_info* FileInfo)
+{
+    UNREFERENCED_PARAMETER(Ino);
+    UNREFERENCED_PARAMETER(FileInfo);
+    fuse_reply_err(Request, 0);
+}
+
+/* The position leads and the scan number trails, so any offset below a valid one still names a position. */
+static const unsigned NtfsScanBits = 20;
+
+static void
+ReadDirectory(fuse_req_t Request,
+              fuse_ino_t Ino,
+              size_t Size,
+              off_t Offset,
+              struct fuse_file_info* FileInfo,
+              bool Plus)
+{
+    NtfsFuseState* State = RequestState(Request);
+    uint64_t Cookie = Offset < 0 ? 0 : (uint64_t)Offset;
+    uint32_t Scan = (uint32_t)(Cookie & ((UINT64_C(1) << NtfsScanBits) - 1));
+    size_t First = (size_t)(Cookie >> NtfsScanBits);
+    std::shared_ptr<NtfsDirectoryListing> Snapshot;
+    auto& Scans = State->DirectoryScans[Ino];
+
+    UNREFERENCED_PARAMETER(FileInfo);
+    /* TODO: update the directory access time under relatime and strictatime. */
+    for (const auto& Known : Scans)
+    {
+        if (Cookie != 0 && Known.first == Scan)
+            Snapshot = Known.second;
+    }
+    /* A read from the start (opendir or rewinddir) sees names added since the last one. */
+    if (!Snapshot)
+    {
+        NTSTATUS Status = GetListing(State, Ino, Snapshot);
+
+        if (!NT_SUCCESS(Status))
+        {
+            fuse_reply_err(Request, Status == STATUS_OBJECT_NAME_INVALID ? EILSEQ
+                                                                         : NtStatusToErrno(Status));
+            return;
+        }
+        if (Scans.empty() || Scans.back().second != Snapshot)
+        {
+            uint32_t Next = Scans.empty() ? 1 : Scans.back().first + 1;
+
+            if (Next >= (UINT32_C(1) << NtfsScanBits))
+                Next = 1;
+            Scans.emplace_back(Next, Snapshot);
+            if (Scans.size() > 4)
+                Scans.erase(Scans.begin());
+        }
+        Scan = Scans.back().first;
+    }
+
+    const NtfsDirectoryListing* Listing = Snapshot.get();
+    if (!Listing)
+    {
+        fuse_reply_buf(Request, NULL, 0);
+        return;
+    }
+    auto Current = State->DirectoryCache.find(Ino);
+    bool IsCurrent = Current != State->DirectoryCache.end() && Current->second.get() == Listing;
+    char* Buffer = (char*)GetReplyBuffer(Request, State, Size);
+    size_t Used = 0;
+    size_t Total = Listing->Entries.size() + 2;
+
+    if (Plus)
+    {
+        State->ListedRecords.clear();
+        State->ListingGeneration = NtfsDiskWriteGenerationLinux();
+    }
+    for (size_t Index = First; Index < Total; Index++)
+    {
+        struct fuse_entry_param Entry;
+        PNtfsFileRecord File = NULL;
+        const char* Name;
+        size_t Needed;
+
+        memset(&Entry, 0, sizeof(Entry));
+        if (Index < 2)
+        {
+            Name = Index == 0 ? "." : "..";
+            Entry.attr.st_ino = (ino_t)((Index == 0 ? Listing->Self : Listing->Parent) &
+                                        UINT64_C(0x0000FFFFFFFFFFFF));
+            Entry.attr.st_mode = S_IFDIR;
+        }
+        else
+        {
+            const NtfsDirectoryName& Child = Listing->Entries[Index - 2];
+
+            Name = Child.Name.c_str();
+            Entry.attr.st_ino = (ino_t)(Child.Reference & UINT64_C(0x0000FFFFFFFFFFFF));
+            Entry.attr.st_mode = Child.Type;
+            if (IsCurrent && (!Child.Type || (Plus && Child.Type == S_IFDIR)))
+            {
+                auto Open = State->OpenFiles.find(InoFromReference(Child.Reference));
+                NTSTATUS Status = STATUS_SUCCESS;
+
+                if (Open != State->OpenFiles.end())
+                    SettleFast(State, &Open->second);
+                if (Open == State->OpenFiles.end())
+                    Status = NtfsMasterFileTableGetFileRecordByReference(StateMft(State),
+                                                                         Child.Reference,
+                                                                         &File);
+                if (NT_SUCCESS(Status))
+                {
+                    Status = FillInodeStat(State,
+                                           InoFromReference(Child.Reference),
+                                           Open != State->OpenFiles.end() ? Open->second.File
+                                                                          : File,
+                                           &Entry.attr);
+                }
+                if (NT_SUCCESS(Status))
+                {
+                    Entry.ino = InoFromReference(Child.Reference);
+                    Entry.generation = Child.Reference >> 48;
+                    Entry.attr_timeout = NtfsFuseCacheTimeout;
+                    Entry.entry_timeout = NtfsFuseCacheTimeout;
+                }
+            }
+        }
+        off_t Next = (off_t)(((uint64_t)(Index + 1) << NtfsScanBits) | Scan);
+
+        Needed = Plus ? fuse_add_direntry_plus(Request, Buffer + Used, Size - Used, Name, &Entry, Next)
+                      : fuse_add_direntry(Request, Buffer + Used, Size - Used, Name, &Entry.attr, Next);
+        decltype(State->LookupRecord) Record(File, NtfsFileRecordDestroy);
+        if (Needed > Size - Used)
+            break;
+        Used += Needed;
+        if (Plus && Index >= 2 && Entry.ino != 0)
+        {
+            NtfsFuseInode& Inode = State->Inodes[Entry.ino];
+            Inode.Reference = Listing->Entries[Index - 2].Reference;
+            Inode.Lookups++;
+            if (IsCurrent)
+            {
+                Inode.ListDirectory = Ino;
+                Inode.ListIndex = Index - 2;
+            }
+            if (Record)
+                State->ListedRecords.emplace(Inode.Reference, std::move(Record));
+        }
+    }
+    fuse_reply_buf(Request, Buffer, Used);
+}
+
+static void
+NtfsLowReaddir(fuse_req_t Request, fuse_ino_t Ino, size_t Size, off_t Offset,
+               struct fuse_file_info* FileInfo)
+{
+    ReadDirectory(Request, Ino, Size, Offset, FileInfo, false);
+}
+
+static void
+NtfsLowReaddirplus(fuse_req_t Request, fuse_ino_t Ino, size_t Size, off_t Offset,
+                   struct fuse_file_info* FileInfo)
+{
+    ReadDirectory(Request, Ino, Size, Offset, FileInfo, true);
+}
+
+static void
+NtfsLowStatfs(fuse_req_t Request, fuse_ino_t Ino)
+{
+    NtfsFuseState* State = RequestState(Request);
+    LARGE_INTEGER FreeClusters;
+    struct statvfs Stat;
+    NTSTATUS Status;
+
+    UNREFERENCED_PARAMETER(Ino);
+    memset(&Stat, 0, sizeof(Stat));
+    Stat.f_bsize = ClusterBytes(State);
+    Stat.f_frsize = Stat.f_bsize;
+    Stat.f_blocks = NtfsVolumeGetClustersInVolume(State->Volume);
+    Status = NtfsVolumeGetFreeClusters(State->Volume, &FreeClusters);
+    if (!NT_SUCCESS(Status))
+    {
+        ReplyStatus(Request, Status);
+        return;
+    }
+    Stat.f_bfree = FreeClusters.QuadPart;
+    Stat.f_bavail = FreeClusters.QuadPart;
+    Stat.f_namemax = NTFS_MAX_FILE_NAME_LENGTH;
+    if (!State->Writable)
+        Stat.f_flag = ST_RDONLY;
+    fuse_reply_statfs(Request, &Stat);
+}
+
+static void
+NtfsLowAccess(fuse_req_t Request, fuse_ino_t Ino, int Mask)
+{
+    NtfsFuseState* State = RequestState(Request);
+    PNtfsFileRecord File = NULL;
+    bool Owned;
+    NTSTATUS Status;
+
+    if ((Mask & W_OK) && !State->Writable)
+    {
+        fuse_reply_err(Request, EROFS);
+        return;
+    }
+    Status = LoadInode(State, Ino, &File, &Owned);
+    if (NT_SUCCESS(Status) && (Mask & W_OK) && IsReadOnlyFile(File))
+    {
+        ReleaseLoaded(File, Owned);
+        fuse_reply_err(Request, EACCES);
+        return;
+    }
+    ReleaseLoaded(File, Owned);
+    ReplyStatus(Request, Status);
 }
 
 /*
@@ -4614,9 +7131,7 @@ NtfsFuseFsync(const char* Path,
 static const char NtfsFuseXattrPrefix[] = "user.";
 
 static bool
-XattrToEaName(const char* Name,
-              const UCHAR** EaName,
-              size_t* EaNameLength)
+XattrToEaName(const char* Name, const UCHAR** EaName, size_t* EaNameLength)
 {
     size_t PrefixLength = sizeof(NtfsFuseXattrPrefix) - 1;
     size_t Length;
@@ -4624,18 +7139,18 @@ XattrToEaName(const char* Name,
     if (strncmp(Name, NtfsFuseXattrPrefix, PrefixLength) != 0)
         return false;
     Length = strlen(Name + PrefixLength);
-    if (Length == 0 || Length > 0xff)
+    if (Length == 0 || Length > 0xff ||
+        IsPosixEaName((const UCHAR*)Name + PrefixLength, Length))
+    {
         return false;
+    }
     *EaName = (const UCHAR*)(Name + PrefixLength);
     *EaNameLength = Length;
     return true;
 }
 
 static bool
-EaNamesEqual(const UCHAR* Left,
-             size_t LeftLength,
-             const UCHAR* Right,
-             size_t RightLength)
+EaNamesEqual(const UCHAR* Left, size_t LeftLength, const UCHAR* Right, size_t RightLength)
 {
     if (LeftLength != RightLength)
         return false;
@@ -4648,17 +7163,12 @@ EaNamesEqual(const UCHAR* Left,
 }
 
 static NTSTATUS
-ReadAllExtendedAttributes(PNtfsFileRecord File,
-                          std::vector<UCHAR>& RawData,
-                          ULONG* RawLength)
+ReadAllExtendedAttributes(PNtfsFileRecord File, std::vector<UCHAR>& RawData, ULONG* RawLength)
 {
     NTSTATUS Status;
 
     *RawLength = 0;
-    Status = NtfsFileRecordReadExtendedAttributes(File,
-                                                  NULL,
-                                                  RawLength,
-                                                  NULL);
+    Status = NtfsFileRecordReadExtendedAttributes(File, NULL, RawLength, NULL);
     if (Status == STATUS_NO_EAS_ON_FILE)
     {
         *RawLength = 0;
@@ -4668,10 +7178,7 @@ ReadAllExtendedAttributes(PNtfsFileRecord File,
         return NT_SUCCESS(Status) ? STATUS_SUCCESS : Status;
 
     RawData.resize(*RawLength);
-    return NtfsFileRecordReadExtendedAttributes(File,
-                                                RawData.data(),
-                                                RawLength,
-                                                NULL);
+    return NtfsFileRecordReadExtendedAttributes(File, RawData.data(), RawLength, NULL);
 }
 
 static NTSTATUS
@@ -4689,18 +7196,12 @@ FindExtendedAttribute(const std::vector<UCHAR>& RawData,
     *Present = false;
     for (;;)
     {
-        Status = NtfsGetNextExtendedAttribute(RawData.data(),
-                                              RawLength,
-                                              &Offset,
-                                              &View);
+        Status = NtfsGetNextExtendedAttribute(RawData.data(), RawLength, &Offset, &View);
         if (Status == STATUS_NO_MORE_EAS)
             return STATUS_SUCCESS;
         if (!NT_SUCCESS(Status))
             return Status;
-        if (EaNamesEqual(View.Name,
-                         View.NameLength,
-                         Name,
-                         NameLength))
+        if (EaNamesEqual(View.Name, View.NameLength, Name, NameLength))
         {
             *Found = View;
             *Present = true;
@@ -4709,257 +7210,303 @@ FindExtendedAttribute(const std::vector<UCHAR>& RawData,
     }
 }
 
-static int
-NtfsFuseGetxattr(const char* Path,
-                 const char* Name,
-                 char* Value,
-                 size_t Size)
+static void
+NtfsLowGetxattr(fuse_req_t Request, fuse_ino_t Ino, const char* Name, size_t Size)
 {
-    NtfsFuseState* State = FuseState();
+    NtfsFuseState* State = RequestState(Request);
     PNtfsFileRecord File = NULL;
     std::vector<UCHAR> RawData;
     NtfsExtendedAttributeView View;
     const UCHAR* EaName;
     size_t EaNameLength;
-    ULONG RawLength;
-    bool Present;
+    ULONG RawLength = 0;
+    bool Present = false;
+    bool Owned;
     NTSTATUS Status;
 
     if (!XattrToEaName(Name, &EaName, &EaNameLength))
-        return -ENODATA;
-
-    Status = Lookup(State->Volume, Path, &File);
-    if (!NT_SUCCESS(Status))
-        return -NtStatusToErrno(Status);
-    Status = ReadAllExtendedAttributes(File, RawData, &RawLength);
+    {
+        fuse_reply_err(Request, ENODATA);
+        return;
+    }
+    Status = LoadInode(State, Ino, &File, &Owned);
     if (NT_SUCCESS(Status))
-        Status = FindExtendedAttribute(RawData,
-                                       RawLength,
-                                       EaName,
-                                       EaNameLength,
-                                       &View,
-                                       &Present);
-    NtfsFileRecordDestroy(File);
+        Status = ReadAllExtendedAttributes(File, RawData, &RawLength);
+    if (NT_SUCCESS(Status))
+        Status = FindExtendedAttribute(RawData, RawLength, EaName, EaNameLength, &View, &Present);
+    ReleaseLoaded(File, Owned);
     if (!NT_SUCCESS(Status))
-        return -NtStatusToErrno(Status);
-    if (!Present)
-        return -ENODATA;
-    if (Size == 0)
-        return (int)View.ValueLength;
-    if (Size < View.ValueLength)
-        return -ERANGE;
-    memcpy(Value, View.Value, View.ValueLength);
-    return (int)View.ValueLength;
+        ReplyStatus(Request, Status);
+    else if (!Present)
+        fuse_reply_err(Request, ENODATA);
+    else if (Size == 0)
+        fuse_reply_xattr(Request, View.ValueLength);
+    else if (Size < View.ValueLength)
+        fuse_reply_err(Request, ERANGE);
+    else
+        fuse_reply_buf(Request, (const char*)View.Value, View.ValueLength);
 }
 
-static int
-NtfsFuseListxattr(const char* Path, char* List, size_t Size)
+static void
+NtfsLowListxattr(fuse_req_t Request, fuse_ino_t Ino, size_t Size)
 {
-    NtfsFuseState* State = FuseState();
+    NtfsFuseState* State = RequestState(Request);
     PNtfsFileRecord File = NULL;
     std::vector<UCHAR> RawData;
+    std::string List;
     NtfsExtendedAttributeView View;
-    ULONG RawLength;
+    ULONG RawLength = 0;
     ULONG Offset = 0;
-    size_t Needed = 0;
-    size_t Emitted = 0;
+    bool Owned;
     NTSTATUS Status;
 
-    Status = Lookup(State->Volume, Path, &File);
-    if (!NT_SUCCESS(Status))
-        return -NtStatusToErrno(Status);
-    Status = ReadAllExtendedAttributes(File, RawData, &RawLength);
-    NtfsFileRecordDestroy(File);
-    if (!NT_SUCCESS(Status))
-        return -NtStatusToErrno(Status);
-
-    for (;;)
+    Status = LoadInode(State, Ino, &File, &Owned);
+    if (NT_SUCCESS(Status))
+        Status = ReadAllExtendedAttributes(File, RawData, &RawLength);
+    while (NT_SUCCESS(Status) && RawLength != 0)
     {
-        Status = NtfsGetNextExtendedAttribute(RawData.data(),
-                                              RawLength,
-                                              &Offset,
-                                              &View);
+        Status = NtfsGetNextExtendedAttribute(RawData.data(), RawLength, &Offset, &View);
         if (Status == STATUS_NO_MORE_EAS)
+        {
+            Status = STATUS_SUCCESS;
             break;
-        if (!NT_SUCCESS(Status))
-            return -NtStatusToErrno(Status);
-
-        Needed += sizeof(NtfsFuseXattrPrefix) - 1 +
-                  View.NameLength + 1;
-        if (Size == 0)
-            continue;
-        if (Needed > Size)
-            return -ERANGE;
-        memcpy(List + Emitted,
-               NtfsFuseXattrPrefix,
-               sizeof(NtfsFuseXattrPrefix) - 1);
-        Emitted += sizeof(NtfsFuseXattrPrefix) - 1;
-        memcpy(List + Emitted, View.Name, View.NameLength);
-        Emitted += View.NameLength;
-        List[Emitted++] = '\0';
+        }
+        if (NT_SUCCESS(Status) && !IsPosixEaName(View.Name, View.NameLength))
+        {
+            List += NtfsFuseXattrPrefix;
+            List.append((const char*)View.Name, View.NameLength);
+            List.push_back('\0');
+        }
     }
-    return (int)Needed;
+    ReleaseLoaded(File, Owned);
+    if (!NT_SUCCESS(Status))
+        ReplyStatus(Request, Status);
+    else if (Size == 0)
+        fuse_reply_xattr(Request, List.size());
+    else if (Size < List.size())
+        fuse_reply_err(Request, ERANGE);
+    else
+        fuse_reply_buf(Request, List.data(), List.size());
 }
 
-static int
-NtfsFuseSetxattr(const char* Path,
-                 const char* Name,
-                 const char* Value,
-                 size_t Size,
-                 int Flags)
+static void
+NtfsLowSetxattr(fuse_req_t Request,
+                fuse_ino_t Ino,
+                const char* Name,
+                const char* Value,
+                size_t Size,
+                int Flags)
 {
-    NtfsFuseState* State = FuseState();
+    NtfsFuseState* State = RequestState(Request);
     PNtfsFileRecord File = NULL;
     NtfsExtendedAttributeUpdate Update = {};
     const UCHAR* EaName;
     size_t EaNameLength;
+    bool Owned = false;
     NTSTATUS Status;
-    int Result;
 
-    Result = RequireWritable(State);
-    if (Result != 0)
-        return Result;
+    if (!State->Writable)
+    {
+        fuse_reply_err(Request, EROFS);
+        return;
+    }
     if (!XattrToEaName(Name, &EaName, &EaNameLength))
-        return -EOPNOTSUPP;
+    {
+        fuse_reply_err(Request, EOPNOTSUPP);
+        return;
+    }
     if (Size > 0xffff)
-        return -E2BIG;
-
-    Status = Lookup(State->Volume, Path, &File);
-    if (!NT_SUCCESS(Status))
-        return -NtStatusToErrno(Status);
-
-    if (Flags & (XATTR_CREATE | XATTR_REPLACE))
+    {
+        fuse_reply_err(Request, E2BIG);
+        return;
+    }
+    Status = LoadInode(State, Ino, &File, &Owned);
+    if (NT_SUCCESS(Status) && (Flags & (XATTR_CREATE | XATTR_REPLACE)))
     {
         std::vector<UCHAR> RawData;
         NtfsExtendedAttributeView View;
-        ULONG RawLength;
+        ULONG RawLength = 0;
         bool Present = false;
 
         Status = ReadAllExtendedAttributes(File, RawData, &RawLength);
         if (NT_SUCCESS(Status))
-            Status = FindExtendedAttribute(RawData,
-                                           RawLength,
-                                           EaName,
-                                           EaNameLength,
-                                           &View,
-                                           &Present);
-        if (NT_SUCCESS(Status) &&
-            (Flags & XATTR_CREATE) && Present)
-        {
+            Status = FindExtendedAttribute(RawData, RawLength, EaName, EaNameLength, &View, &Present);
+        if (NT_SUCCESS(Status) && (Flags & XATTR_CREATE) && Present)
             Status = STATUS_OBJECT_NAME_COLLISION;
-        }
-        if (NT_SUCCESS(Status) &&
-            (Flags & XATTR_REPLACE) && !Present)
+        if (NT_SUCCESS(Status) && (Flags & XATTR_REPLACE) && !Present)
         {
-            NtfsFileRecordDestroy(File);
-            return -ENODATA;
+            ReleaseLoaded(File, Owned);
+            fuse_reply_err(Request, ENODATA);
+            return;
         }
     }
-
     if (NT_SUCCESS(Status))
     {
         Update.Operation = NTFS_EA_UPDATE_SET;
-        Update.Flags = 0;
         Update.NameLength = (UINT8)EaNameLength;
         Update.ValueLength = (UINT16)Size;
         Update.Name = EaName;
         Update.Value = (const UCHAR*)Value;
-        Status = NtfsFileRecordUpdateExtendedAttributes(File,
-                                                        &Update,
-                                                        1);
+        Status = NtfsFileRecordUpdateExtendedAttributes(File, &Update, 1);
     }
-    NtfsFileRecordDestroy(File);
-    return NT_SUCCESS(Status) ? 0 : -NtStatusToErrno(Status);
+    ReleaseLoaded(File, Owned);
+    ReplyStatus(Request, Status);
 }
 
-static int
-NtfsFuseRemovexattr(const char* Path, const char* Name)
+static void
+NtfsLowRemovexattr(fuse_req_t Request, fuse_ino_t Ino, const char* Name)
 {
-    NtfsFuseState* State = FuseState();
+    NtfsFuseState* State = RequestState(Request);
     PNtfsFileRecord File = NULL;
     std::vector<UCHAR> RawData;
     NtfsExtendedAttributeView View;
     NtfsExtendedAttributeUpdate Update = {};
     const UCHAR* EaName;
     size_t EaNameLength;
-    ULONG RawLength;
+    ULONG RawLength = 0;
     bool Present = false;
+    bool Owned = false;
     NTSTATUS Status;
-    int Result;
 
-    Result = RequireWritable(State);
-    if (Result != 0)
-        return Result;
+    if (!State->Writable)
+    {
+        fuse_reply_err(Request, EROFS);
+        return;
+    }
     if (!XattrToEaName(Name, &EaName, &EaNameLength))
-        return -ENODATA;
-
-    Status = Lookup(State->Volume, Path, &File);
-    if (!NT_SUCCESS(Status))
-        return -NtStatusToErrno(Status);
-    Status = ReadAllExtendedAttributes(File, RawData, &RawLength);
+    {
+        fuse_reply_err(Request, ENODATA);
+        return;
+    }
+    Status = LoadInode(State, Ino, &File, &Owned);
     if (NT_SUCCESS(Status))
-        Status = FindExtendedAttribute(RawData,
-                                       RawLength,
-                                       EaName,
-                                       EaNameLength,
-                                       &View,
-                                       &Present);
+        Status = ReadAllExtendedAttributes(File, RawData, &RawLength);
+    if (NT_SUCCESS(Status))
+        Status = FindExtendedAttribute(RawData, RawLength, EaName, EaNameLength, &View, &Present);
     if (NT_SUCCESS(Status) && !Present)
     {
-        NtfsFileRecordDestroy(File);
-        return -ENODATA;
+        ReleaseLoaded(File, Owned);
+        fuse_reply_err(Request, ENODATA);
+        return;
     }
     if (NT_SUCCESS(Status))
     {
         Update.Operation = NTFS_EA_UPDATE_REMOVE;
         Update.NameLength = (UINT8)EaNameLength;
         Update.Name = EaName;
-        Status = NtfsFileRecordUpdateExtendedAttributes(File,
-                                                        &Update,
-                                                        1);
+        Status = NtfsFileRecordUpdateExtendedAttributes(File, &Update, 1);
     }
-    NtfsFileRecordDestroy(File);
-    return NT_SUCCESS(Status) ? 0 : -NtStatusToErrno(Status);
+    ReleaseLoaded(File, Owned);
+    ReplyStatus(Request, Status);
 }
 
 static int
 MountImage(int Argc, char** Argv, NtfsFuseState* State)
 {
-    struct fuse_operations Operations = {};
+    struct fuse_lowlevel_ops Operations = {};
+    struct fuse_args Arguments = FUSE_ARGS_INIT(Argc, Argv);
+    struct fuse_cmdline_opts Options;
+    struct fuse_session* Session;
+    PNtfsFileRecord Root = NULL;
+    int Result = 1;
 
-    Operations.init = NtfsFuseInit;
-    Operations.getattr = NtfsFuseGetattr;
-    Operations.readlink = NtfsFuseReadlink;
-    Operations.access = NtfsFuseAccess;
-    Operations.open = NtfsFuseOpen;
-    Operations.release = NtfsFuseRelease;
-    Operations.read = NtfsFuseRead;
-    Operations.opendir = NtfsFuseOpendir;
-    Operations.readdir = NtfsFuseReaddir;
-    Operations.releasedir = NtfsFuseReleasedir;
-    Operations.statfs = NtfsFuseStatfs;
-    /* The mutation hooks refuse every request with EROFS unless the mount
-     * was opened with --writable.
-     */
-    Operations.create = NtfsFuseCreate;
-    Operations.mknod = NtfsFuseMknod;
-    Operations.mkdir = NtfsFuseMkdir;
-    Operations.unlink = NtfsFuseUnlink;
-    Operations.rmdir = NtfsFuseRmdir;
-    Operations.rename = NtfsFuseRename;
-    Operations.link = NtfsFuseLink;
-    Operations.write = NtfsFuseWrite;
-    Operations.truncate = NtfsFuseTruncate;
-    Operations.fallocate = NtfsFuseFallocate;
-    Operations.utimens = NtfsFuseUtimens;
-    Operations.chmod = NtfsFuseChmod;
-    Operations.chown = NtfsFuseChown;
-    Operations.fsync = NtfsFuseFsync;
-    Operations.getxattr = NtfsFuseGetxattr;
-    Operations.listxattr = NtfsFuseListxattr;
-    Operations.setxattr = NtfsFuseSetxattr;
-    Operations.removexattr = NtfsFuseRemovexattr;
-    return fuse_main(Argc, Argv, &Operations, State);
+    if (!NT_SUCCESS(NtfsMasterFileTableGetFileRecordFromQuery(StateMft(State),
+                                                              const_cast<PWCHAR>(L"\\"),
+                                                              &Root)))
+    {
+        fprintf(stderr, "cannot open the root directory\n");
+        return 1;
+    }
+    State->Inodes[FUSE_ROOT_ID] = NtfsFuseInode{NtfsFileRecordGetReference(Root), 1, false, 0, 0};
+    NtfsFileRecordDestroy(Root);
+
+    Operations.init = NtfsLowInit;
+    Operations.lookup = DispatchRequest<NtfsLowLookup>;
+    Operations.forget = DispatchRequest<NtfsLowForget>;
+    Operations.forget_multi = DispatchRequest<NtfsLowForgetMulti>;
+    Operations.getattr = DispatchRequest<NtfsLowGetattr>;
+    Operations.setattr = DispatchMutation<NtfsLowSetattr>;
+    Operations.readlink = DispatchRequest<NtfsLowReadlink>;
+    Operations.mknod = DispatchRequest<NtfsLowMknod>;
+    Operations.mkdir = DispatchRequest<NtfsLowMkdir>;
+    Operations.unlink = DispatchMutation<NtfsLowUnlink>;
+    Operations.rmdir = DispatchMutation<NtfsLowRmdir>;
+    Operations.symlink = DispatchRequest<NtfsLowSymlink>;
+    Operations.rename = DispatchMutation<NtfsLowRename>;
+    Operations.link = DispatchRequest<NtfsLowLink>;
+    Operations.open = NtfsLowOpenAny;
+    Operations.read = NtfsLowReadFast;
+    Operations.write = NtfsLowWriteFast;
+    Operations.release = DispatchRequest<NtfsLowRelease>;
+    Operations.fsync = DispatchRequest<NtfsLowFsync>;
+    Operations.fsyncdir = DispatchRequest<NtfsLowFsync>;
+    Operations.opendir = DispatchRequest<NtfsLowOpendir>;
+    Operations.readdir = DispatchRequest<NtfsLowReaddir>;
+    Operations.readdirplus = DispatchRequest<NtfsLowReaddirplus>;
+    Operations.releasedir = DispatchRequest<NtfsLowReleasedir>;
+    Operations.statfs = DispatchRequest<NtfsLowStatfs>;
+    Operations.setxattr = DispatchRequest<NtfsLowSetxattr>;
+    Operations.getxattr = DispatchRequest<NtfsLowGetxattr>;
+    Operations.listxattr = DispatchRequest<NtfsLowListxattr>;
+    Operations.removexattr = DispatchRequest<NtfsLowRemovexattr>;
+    Operations.access = DispatchRequest<NtfsLowAccess>;
+    Operations.create = DispatchRequest<NtfsLowCreate>;
+    Operations.fallocate = DispatchRequest<NtfsLowFallocate>;
+
+    if (fuse_parse_cmdline(&Arguments, &Options) != 0)
+        return 2;
+    if (!Options.mountpoint)
+    {
+        fprintf(stderr, "missing mount point\n");
+        fuse_opt_free_args(&Arguments);
+        return 2;
+    }
+    Session = fuse_session_new(&Arguments, &Operations, sizeof(Operations), State);
+    if (Session)
+    {
+        State->Session = Session;
+        if (fuse_set_signal_handlers(Session) == 0)
+        {
+            if (fuse_session_mount(Session, Options.mountpoint) == 0)
+            {
+                if (State->Writable)
+                    RaiseDirtyShare(Options.mountpoint);
+                fuse_daemonize(Options.foreground);
+                if (!State->RingTransport)
+                {
+                    unsigned Count = std::thread::hardware_concurrency();
+
+                    Count = Count > 2 ? 2 : Count > 1 ? 1 : 0;
+                    for (unsigned Index = 0; Index < Count; Index++)
+                        State->Workers.emplace_back(WorkerLoop, State);
+                }
+                if (!State->Workers.empty())
+                    State->PrefetchThread = std::thread(PrefetchLoop, State);
+                Result = SessionLoop(State) == 0 ? 0 : 1;
+                fuse_session_unmount(Session);
+                StopWorkers(State);
+            }
+            fuse_remove_signal_handlers(Session);
+        }
+        State->Session = NULL;
+        fuse_session_destroy(Session);
+    }
+    while (!State->OpenFiles.empty())
+    {
+        auto Open = State->OpenFiles.begin();
+
+        Open->second.References = 1;
+        ReleaseOpenFile(State, Open->first);
+    }
+    for (const auto& Inode : State->Inodes)
+    {
+        if (Inode.second.Unlinked)
+            DeleteUnlinkedRecord(State, Inode.second.Reference);
+    }
+    FlushPendingAccess(State);
+    free(Options.mountpoint);
+    fuse_opt_free_args(&Arguments);
+    return Result;
 }
 #endif
 
@@ -4985,7 +7532,7 @@ ShrinkImageWrite(void* Context, uint64_t Offset, uint32_t Length, const void* Bu
 }
 
 static NTSTATUS
-ShrinkImageVolume(const char* Path, ULONGLONG NewVolumeSectors)
+ResizeImageVolume(const char* Path, ULONGLONG NewVolumeSectors, bool Grow)
 {
     std::vector<uint8_t> Workspace(EXPAND_WORKSPACE_BYTES);
     ShrinkImageIo Io;
@@ -5009,14 +7556,19 @@ ShrinkImageVolume(const char* Path, ULONGLONG NewVolumeSectors)
     Device.Write = ShrinkImageWrite;
     Device.DiskSize = (uint64_t)Info.st_size;
     Device.SectorSize = (uint32_t)Boot[11] | ((uint32_t)Boot[12] << 8);
-    Result = ExpandShrinkVolume(&Device, 0, NewVolumeSectors, Workspace.data());
+    Result = Grow
+        ? ExpandGrowVolume(&Device, 0, NewVolumeSectors, Workspace.data())
+        : ExpandShrinkVolume(&Device, 0, NewVolumeSectors, Workspace.data());
     fsync(Io.Fd);
     close(Io.Fd);
+    if (Result != EXPAND_OK)
+        fprintf(stderr, "resize: %s\n", ExpandStatusText(Result));
     switch (Result)
     {
         case EXPAND_OK:
             return STATUS_SUCCESS;
         case EXPAND_BAD_PARAMETER:
+        case EXPAND_NOTHING_TO_DO:
             return STATUS_INVALID_PARAMETER;
         case EXPAND_NO_ROOM:
             return STATUS_ALREADY_COMMITTED;
@@ -5024,6 +7576,282 @@ ShrinkImageVolume(const char* Path, ULONGLONG NewVolumeSectors)
             return STATUS_FILE_CORRUPT_ERROR;
     }
 }
+
+struct EvacuationItem
+{
+    ULONGLONG BaseReference;
+    AttributeType Type;
+    std::vector<WCHAR> Name;
+    ULONGLONG Vcn;
+    ULONGLONG Count;
+    bool Units;
+};
+
+/* Decodes one attribute's mapping pairs into (VCN, LCN or -1, length). */
+static bool
+DecodeMappingPairs(const UCHAR* Pairs,
+                   const UCHAR* End,
+                   ULONGLONG Vcn,
+                   std::vector<std::tuple<ULONGLONG, LONGLONG, ULONGLONG>>& Runs)
+{
+    LONGLONG Lcn = 0;
+
+    while (Pairs < End && *Pairs != 0)
+    {
+        unsigned LengthBytes = *Pairs & 0x0f;
+        unsigned OffsetBytes = *Pairs >> 4;
+        ULONGLONG Length = 0;
+        LONGLONG Delta = 0;
+
+        if (LengthBytes == 0 || LengthBytes > 8 || OffsetBytes > 8 ||
+            Pairs + 1 + LengthBytes + OffsetBytes > End)
+        {
+            return false;
+        }
+        for (unsigned Index = 0; Index < LengthBytes; Index++)
+            Length |= (ULONGLONG)Pairs[1 + Index] << (8 * Index);
+        for (unsigned Index = 0; Index < OffsetBytes; Index++)
+            Delta |= (LONGLONG)Pairs[1 + LengthBytes + Index] << (8 * Index);
+        if (OffsetBytes != 0 && OffsetBytes < 8 && (Pairs[LengthBytes + OffsetBytes] & 0x80))
+            Delta -= (LONGLONG)1 << (8 * OffsetBytes);
+        if (OffsetBytes == 0)
+        {
+            Runs.emplace_back(Vcn, -1, Length);
+        }
+        else
+        {
+            Lcn += Delta;
+            Runs.emplace_back(Vcn, Lcn, Length);
+        }
+        Vcn += Length;
+        Pairs += 1 + LengthBytes + OffsetBytes;
+    }
+    return true;
+}
+
+/*
+ * Moves every movable cluster at or beyond Boundary below it, the way a
+ * defragmenter prepares a shrink: new allocations are capped at Boundary
+ * first, then each nonresident attribute run past it is moved into free
+ * space below it. $MFTMirr and $LogFile are left to the offline shrink;
+ * any other unmovable system file past Boundary fails the evacuation.
+ */
+static NTSTATUS
+EvacuateAbove(NtfsFuseState* State, ULONGLONG Boundary)
+{
+    PNtfsMasterFileTable Mft = NtfsVolumeGetMft(State->Volume);
+    NtfsVolumeInformation Information;
+    std::vector<EvacuationItem> Items;
+    std::vector<UCHAR> Record;
+    std::vector<UCHAR> Bitmap;
+    ULONGLONG Requested;
+    ULONGLONG Cursor = 0;
+    NTSTATUS Status;
+
+    Status = NtfsVolumeQueryInformation(State->Volume, &Information);
+    if (!NT_SUCCESS(Status))
+        return Status;
+    if (Boundary == 0 || Boundary >= Information.TotalClusters)
+        return STATUS_INVALID_PARAMETER;
+    NtfsVolumeSetAllocationLimit(State->Volume, Boundary);
+
+    Record.resize(Information.BytesPerFileRecordSegment);
+    Requested = Information.MftValidDataLength / Information.BytesPerFileRecordSegment;
+    while (Requested-- != 0)
+    {
+        ULONGLONG Returned = 0;
+        ULONG Length = (ULONG)Record.size();
+        PFileRecordHeader Header;
+        ULONGLONG Base;
+        ULONG Offset;
+
+        Status = NtfsMasterFileTableReadFileRecord(Mft, Requested, &Returned, Record.data(), &Length);
+        if (!NT_SUCCESS(Status))
+            return Status;
+        Requested = Returned & UINT64_C(0x0000FFFFFFFFFFFF);
+        Header = (PFileRecordHeader)Record.data();
+        Base = Header->BaseFileRecord
+            ? Header->BaseFileRecord
+            : (Returned & UINT64_C(0x0000FFFFFFFFFFFF)) | ((ULONGLONG)Header->SequenceNumber << 48);
+        for (Offset = Header->AttributeOffset; Offset + 16 <= Header->ActualSize;)
+        {
+            PAttribute Attribute = (PAttribute)(Record.data() + Offset);
+            std::vector<std::tuple<ULONGLONG, LONGLONG, ULONGLONG>> Runs;
+            ULONGLONG BaseNumber = Base & UINT64_C(0x0000FFFFFFFFFFFF);
+
+            if (Attribute->AttributeType == TypeAttributeEndMarker || Attribute->Length == 0 ||
+                Offset + Attribute->Length > Header->ActualSize)
+            {
+                break;
+            }
+            if (Attribute->IsNonResident &&
+                !DecodeMappingPairs((const UCHAR*)Attribute + Attribute->NonResident.DataRunsOffset,
+                                    (const UCHAR*)Attribute + Attribute->Length,
+                                    Attribute->NonResident.FirstVCN,
+                                    Runs))
+            {
+                return STATUS_FILE_CORRUPT_ERROR;
+            }
+            for (auto& Run : Runs)
+            {
+                ULONGLONG Vcn = std::get<0>(Run);
+                LONGLONG Lcn = std::get<1>(Run);
+                ULONGLONG Count = std::get<2>(Run);
+
+                if (Lcn < 0 || (ULONGLONG)Lcn + Count <= Boundary)
+                    continue;
+                if (BaseNumber == _MFTMirr || BaseNumber == _LogFile)
+                    continue;
+                if (BaseNumber == _Bitmap || BaseNumber == _Boot || BaseNumber == _BadClus)
+                {
+                    fprintf(stderr, "shrink: record %llu has clusters past the new end\n",
+                            (unsigned long long)BaseNumber);
+                    return STATUS_ALREADY_COMMITTED;
+                }
+                EvacuationItem Item;
+                ULONGLONG Skip = (ULONGLONG)Lcn < Boundary ? Boundary - (ULONGLONG)Lcn : 0;
+
+                Item.BaseReference = Base;
+                Item.Type = (AttributeType)Attribute->AttributeType;
+                Item.Name.assign((const WCHAR*)((const UCHAR*)Attribute + Attribute->NameOffset),
+                                 (const WCHAR*)((const UCHAR*)Attribute + Attribute->NameOffset) +
+                                     Attribute->NameLength);
+                Item.Name.push_back(L'\0');
+                Item.Vcn = Vcn + Skip;
+                Item.Count = Count - Skip;
+                Item.Units = (Attribute->Flags & (ATTR_COMPRESSED | ATTR_SPARSE)) != 0;
+                Items.push_back(std::move(Item));
+            }
+            Offset += Attribute->Length;
+        }
+    }
+    if (Items.empty())
+        return STATUS_SUCCESS;
+
+    {
+        ULONGLONG Returned = 0;
+        ULONGLONG Size = 0;
+        ULONG Length = (ULONG)((Boundary + 7) / 8 + 8);
+
+        Bitmap.resize(Length);
+        Status = NtfsVolumeReadBitmap(State->Volume, 0, &Returned, &Size, Bitmap.data(), &Length);
+        if (Status == STATUS_BUFFER_OVERFLOW)
+            Status = STATUS_SUCCESS;
+        if (!NT_SUCCESS(Status))
+            return Status;
+    }
+    auto Used = [&Bitmap](ULONGLONG Lcn) { return (Bitmap[Lcn / 8] >> (Lcn & 7)) & 1; };
+
+    for (EvacuationItem& Item : Items)
+    {
+        PNtfsFileRecord File = NULL;
+
+        Status = NtfsMasterFileTableGetFileRecordByReference(Mft, Item.BaseReference, &File);
+        if (!NT_SUCCESS(Status))
+            return Status;
+        if (Item.Units)
+        {
+            ULONGLONG End = Item.Vcn + Item.Count;
+
+            Item.Vcn -= Item.Vcn % 16;
+            Item.Count = ((End + 15) / 16) * 16 - Item.Vcn;
+        }
+        while (NT_SUCCESS(Status) && Item.Count != 0)
+        {
+            ULONGLONG Start;
+            ULONGLONG Free = 0;
+            ULONGLONG Want = Item.Units ? 16 : Item.Count;
+
+            while (Cursor < Boundary && Used(Cursor))
+                Cursor++;
+            for (Start = Cursor; Start < Boundary && Free < Want;)
+            {
+                if (Used(Start + Free) || Start + Free >= Boundary)
+                {
+                    if (Item.Units)
+                    {
+                        Start += Free + 1;
+                        Free = 0;
+                        continue;
+                    }
+                    break;
+                }
+                Free++;
+            }
+            if (Free == 0 || Start >= Boundary)
+            {
+                Status = STATUS_DISK_FULL;
+                break;
+            }
+            ULONG Take = (ULONG)std::min<ULONGLONG>(Free, Item.Units ? 16 : Item.Count);
+
+            Status = NtfsFileRecordMoveClusters(File,
+                                                Item.Type,
+                                                Item.Name.size() > 1 ? Item.Name.data() : NULL,
+                                                Item.Vcn,
+                                                Start,
+                                                Take);
+            if (NT_SUCCESS(Status))
+            {
+                for (ULONGLONG Lcn = Start; Lcn < Start + Take; Lcn++)
+                    Bitmap[Lcn / 8] |= (UCHAR)(1u << (Lcn & 7));
+                Item.Vcn += Take;
+                Item.Count -= Take;
+            }
+        }
+        NtfsFileRecordDestroy(File);
+        if (!NT_SUCCESS(Status))
+        {
+            fprintf(stderr, "shrink: moving record %llu type 0x%x failed 0x%08" PRIx32 "\n",
+                    (unsigned long long)(Item.BaseReference & UINT64_C(0x0000FFFFFFFFFFFF)),
+                    (unsigned)Item.Type, (uint32_t)Status);
+            return Status;
+        }
+    }
+    return STATUS_SUCCESS;
+}
+
+#if NTFSLIB_EXPAND_OFFLINE
+static void
+ExpandDiskLog(void* Context, const char* Line)
+{
+    UNREFERENCED_PARAMETER(Context);
+    fputs(Line, stdout);
+}
+
+/* Grows one partition of a whole-disk image to the end of the image file,
+ * then its NTFS volume, as lntexpandstorage does on a live disk. */
+static int
+ExpandDiskImage(const char* Path, uint32_t PartitionNumber)
+{
+    ShrinkImageIo Io;
+    EXPAND_DEVICE Device;
+    EXPAND_PLAN Plan;
+    struct stat Info;
+    int Result;
+
+    Io.Fd = open(Path, O_RDWR);
+    if (Io.Fd < 0 || fstat(Io.Fd, &Info) != 0)
+    {
+        perror(Path);
+        return 1;
+    }
+    memset(&Device, 0, sizeof(Device));
+    Device.Context = &Io;
+    Device.Read = ShrinkImageRead;
+    Device.Write = ShrinkImageWrite;
+    Device.Log = ExpandDiskLog;
+    Device.DiskSize = (uint64_t)Info.st_size;
+    Device.SectorSize = 512;
+    Result = ExpandBuildPlan(&Device, PartitionNumber, 0, 0, &Plan);
+    if (Result == EXPAND_OK)
+        Result = ExpandApplyPlan(&Device, &Plan);
+    fsync(Io.Fd);
+    close(Io.Fd);
+    printf("expand-disk: %s\n", ExpandStatusText(Result));
+    return Result == EXPAND_OK ? 0 : 1;
+}
+#endif
 
 static void
 PrintUsage(const char* Program)
@@ -5074,10 +7902,14 @@ PrintUsage(const char* Program)
             "  %s --volume-data IMAGE\n"
             "  %s --move IMAGE PATH START_VCN START_LCN CLUSTER_COUNT [CLUSTER_LIMIT]\n"
             "  %s --shrink IMAGE NEW_NUMBER_OF_SECTORS\n"
+            "  %s --grow IMAGE NEW_NUMBER_OF_SECTORS\n"
+            "  %s --expand-disk DISK_IMAGE [PARTITION_NUMBER]\n"
             "  %s --mft-record IMAGE FILE_REFERENCE\n"
             "  %s [--show-metadata] --streams IMAGE PATH\n"
-            "  %s [--show-metadata] [--writable] IMAGE MOUNTPOINT"
-            " [FUSE options]\n",
+            "  %s [--show-metadata] [--writable [--direct-io] [--writeback-cache|--write-through]]"
+            " IMAGE MOUNTPOINT [FUSE options]\n",
+            Program,
+            Program,
             Program,
             Program,
             Program,
@@ -6352,15 +9184,54 @@ main(int Argc, char** Argv)
         if (NewClusters == 0 || NewClusters >= Clusters)
             Status = STATUS_INVALID_PARAMETER;
         else
+            Status = EvacuateAbove(&State, NewClusters);
+#if !NTFSLIB_EXPAND_OFFLINE
+        /* Without the offline resize core, $LogFile and $MFTMirr cannot move. */
+        if (NT_SUCCESS(Status))
             Status = NtfsVolumeAreClustersFree(State.Volume, NewClusters, Clusters, &Free);
-        CloseImage(&State);
         if (NT_SUCCESS(Status) && !Free)
             Status = STATUS_ALREADY_COMMITTED;
+#else
+        UNREFERENCED_PARAMETER(Free);
+#endif
+        CloseImage(&State);
         if (NT_SUCCESS(Status))
-            Status = ShrinkImageVolume(Argv[First + 1], NewNumberOfSectors - 1);
+            Status = ResizeImageVolume(Argv[First + 1], NewNumberOfSectors - 1, false);
         printf("shrink status 0x%08" PRIx32 "\n", (uint32_t)Status);
         return NT_SUCCESS(Status) ? 0 : 1;
     }
+
+    if (strcmp(Argv[First], "--grow") == 0)
+    {
+        ULONGLONG NewNumberOfSectors;
+
+        if (First + 3 != Argc ||
+            !ParseUnsigned(Argv[First + 2], INT64_MAX, &NewNumberOfSectors) ||
+            NewNumberOfSectors < 2)
+        {
+            PrintUsage(Argv[0]);
+            return 2;
+        }
+        Status = ResizeImageVolume(Argv[First + 1], NewNumberOfSectors - 1, true);
+        printf("grow status 0x%08" PRIx32 "\n", (uint32_t)Status);
+        return NT_SUCCESS(Status) ? 0 : 1;
+    }
+
+#if NTFSLIB_EXPAND_OFFLINE
+    if (strcmp(Argv[First], "--expand-disk") == 0)
+    {
+        ULONGLONG PartitionNumber = 0;
+
+        if ((First + 2 != Argc && First + 3 != Argc) ||
+            (First + 3 == Argc &&
+             !ParseUnsigned(Argv[First + 2], 128, &PartitionNumber)))
+        {
+            PrintUsage(Argv[0]);
+            return 2;
+        }
+        return ExpandDiskImage(Argv[First + 1], (uint32_t)PartitionNumber);
+    }
+#endif
 
     if (strcmp(Argv[First],
                "--volume-data") == 0)
@@ -6500,10 +9371,27 @@ main(int Argc, char** Argv)
     {
         bool WritableMount = false;
 
+        State.WritebackCache = true;
+        State.DirectIo = false;
+        State.NoAtime = false;
+        State.StrictAtime = false;
         if (First < Argc &&
             strcmp(Argv[First], "--writable") == 0)
         {
             WritableMount = true;
+            First++;
+        }
+        while (First < Argc && strncmp(Argv[First], "--", 2) == 0)
+        {
+            /* FIXME: a shared mapping's stale page can be written back over a direct write. */
+            if (strcmp(Argv[First], "--direct-io") == 0)
+                State.DirectIo = true;
+            else if (strcmp(Argv[First], "--writeback-cache") == 0)
+                State.WritebackCache = true;
+            else if (strcmp(Argv[First], "--write-through") == 0)
+                State.WritebackCache = false;
+            else
+                break;
             First++;
         }
         if (First + 2 > Argc)
@@ -6529,31 +9417,63 @@ main(int Argc, char** Argv)
         State.Writable = WritableMount;
 
         /*
-         * Remove IMAGE from the FUSE argv, retain MOUNTPOINT/options, and
-         * force single-threaded operation because the shared core has no
-         * internal locking. Mounts stay read-only unless --writable was
-         * given; writable mounts publish every mutation in a readable
-         * order but are not crash-atomic until LFS transactions exist.
+         * Remove IMAGE from the FUSE argv and retain MOUNTPOINT/options.
+         * Mounts stay read-only unless --writable was given; writable mounts
+         * publish every mutation in a readable order but are not
+         * crash-atomic until LFS transactions exist.
          */
         {
             std::vector<char*> FuseArguments;
-            static char SingleThreaded[] = "-s";
             static char ReadOnly[] = "-oro";
-            static char KernelCache[] = "-okernel_cache";
-            static char AttributeTimeout[] = "-oattr_timeout=60";
-            static char EntryTimeout[] = "-oentry_timeout=60";
-            static char NegativeTimeout[] = "-onegative_timeout=5";
+            static char Permissions[] = "-odefault_permissions";
 
+            static std::vector<std::string> Filtered;
+
+            Filtered.reserve((size_t)Argc);
             FuseArguments.push_back(Argv[0]);
             for (int Index = First + 1; Index < Argc; Index++)
-                FuseArguments.push_back(Argv[Index]);
-            FuseArguments.push_back(SingleThreaded);
+            {
+                std::string Options;
+                bool Separate = strcmp(Argv[Index], "-o") == 0 && Index + 1 < Argc;
+                const char* List = Separate ? Argv[Index + 1]
+                                            : strncmp(Argv[Index], "-o", 2) == 0 ? Argv[Index] + 2 : NULL;
+
+                if (!List)
+                {
+                    FuseArguments.push_back(Argv[Index]);
+                    continue;
+                }
+                /* libfuse rejects mount(8)'s access-time options; the driver applies them. */
+                for (const char* Cursor = List; *Cursor;)
+                {
+                    const char* Comma = strchr(Cursor, ',');
+                    std::string Option(Cursor, Comma ? (size_t)(Comma - Cursor) : strlen(Cursor));
+
+                    /* FIXME: a later remount,rw is not seen; the daemon keeps refusing writes. */
+                    if (Option == "ro")
+                        State.Writable = false;
+                    if (Option == "noatime")
+                        State.NoAtime = true;
+                    else if (Option == "strictatime")
+                        State.StrictAtime = true;
+                    else if (Option != "atime" && Option != "relatime" && Option != "norelatime" &&
+                             Option != "nostrictatime" &&
+                             Option != "diratime" && Option != "nodiratime" &&
+                             Option != "lazytime" && Option != "nolazytime" && !Option.empty())
+                        Options += (Options.empty() ? "" : ",") + Option;
+                    Cursor = Comma ? Comma + 1 : Cursor + strlen(Cursor);
+                }
+                if (Separate)
+                    Index++;
+                if (!Options.empty())
+                {
+                    Filtered.push_back("-o" + Options);
+                    FuseArguments.push_back(const_cast<char*>(Filtered.back().c_str()));
+                }
+            }
             if (!WritableMount)
                 FuseArguments.push_back(ReadOnly);
-            FuseArguments.push_back(KernelCache);
-            FuseArguments.push_back(AttributeTimeout);
-            FuseArguments.push_back(EntryTimeout);
-            FuseArguments.push_back(NegativeTimeout);
+            FuseArguments.push_back(Permissions);
 
             Result = MountImage((int)FuseArguments.size(),
                                 FuseArguments.data(),

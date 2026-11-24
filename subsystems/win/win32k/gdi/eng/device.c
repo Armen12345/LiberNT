@@ -464,6 +464,28 @@ EngpGetDisplayDriverParameters(
     return Status;
 }
 
+BOOL
+EngpIsDisplayAttached(
+    _In_ PGRAPHICS_DEVICE pGraphicsDevice)
+{
+    DWORD dwAttached = (pGraphicsDevice->StateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE) ? 1 : 0;
+    RTL_QUERY_REGISTRY_TABLE AttachTable[] =
+    {
+        { NULL, RTL_QUERY_REGISTRY_DIRECT, L"Attach.ToDesktop", &dwAttached, REG_NONE, NULL, 0 },
+        { 0 }
+    };
+    HKEY hKey;
+
+    hKey = EngpGetRegistryHandleFromDeviceMap(pGraphicsDevice);
+    if (hKey)
+    {
+        RtlQueryRegistryValues(RTL_REGISTRY_HANDLE, (PWSTR)hKey, AttachTable, NULL, NULL);
+        ZwClose(hKey);
+    }
+    /* The primary device always holds the desktop */
+    return dwAttached != 0 || (pGraphicsDevice->StateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE);
+}
+
 DWORD
 EngpGetDisplayDriverAccelerationLevel(
     _In_ PGRAPHICS_DEVICE pGraphicsDevice)
@@ -724,6 +746,36 @@ EngpUpdateMonitorDevices(
     return STATUS_SUCCESS;
 }
 
+/* A display device without a PDEV lists the modes its driver reports; the list is built once and rebuilt only on request */
+BOOL
+NTAPI
+EngpBuildDetachedModeList(
+    _Inout_ PGRAPHICS_DEVICE pGraphicsDevice,
+    _In_ BOOL bRefresh)
+{
+    PDEVMODEINFO pdminfo, pdmiNext;
+    BOOL bResult;
+
+    EngAcquireSemaphore(ghsemGraphicsDeviceList);
+    if (bRefresh)
+    {
+        for (pdminfo = pGraphicsDevice->pdevmodeInfo; pdminfo; pdminfo = pdmiNext)
+        {
+            pdmiNext = pdminfo->pdmiNext;
+            ExFreePoolWithTag(pdminfo, GDITAG_DEVMODE);
+        }
+        pGraphicsDevice->pdevmodeInfo = NULL;
+        if (pGraphicsDevice->pDevModeList)
+            ExFreePoolWithTag(pGraphicsDevice->pDevModeList, GDITAG_GDEVICE);
+        pGraphicsDevice->pDevModeList = NULL;
+        pGraphicsDevice->cDevModes = 0;
+    }
+    bResult = LDEVOBJ_bBuildDevmodeList(pGraphicsDevice);
+    ASSERT(!bResult || pGraphicsDevice->cDevModes != 0);
+    EngReleaseSemaphore(ghsemGraphicsDeviceList);
+    return bResult;
+}
+
 BOOLEAN
 NTAPI
 EngpReferenceMonitorDevice(
@@ -757,6 +809,9 @@ EngpRegisterGraphicsDevice(
     PFILE_OBJECT pFileObject;
     NTSTATUS Status;
     VIDEO_WIN32K_CALLBACKS Win32kCallbacks;
+    PUSER_SESSION DisplaySession;
+    PEPROCESS CsrProcess;
+    KAPC_STATE ApcState;
     ULONG ulReturn;
     PWSTR pwsz;
     ULONG cj;
@@ -791,11 +846,27 @@ EngpRegisterGraphicsDevice(
 
     /* Initialize and register the device with videoprt for Win32k callbacks */
     Win32kCallbacks.PhysDisp = pGraphicsDevice;
-    Win32kCallbacks.Callout = VideoPortCallout;
+    Win32kCallbacks.Callout = NULL;
     // Reset the data being returned prior to the call.
     Win32kCallbacks.bACPI = FALSE;
     Win32kCallbacks.pPhysDeviceObject = NULL;
     Win32kCallbacks.DualviewFlags = 0;
+
+    /* Each session runs its own win32k: only the display session takes the callouts, registered from its CSRSS to outlive the caller */
+    DisplaySession = ReadPointerAcquire((PVOID volatile *)&gpDisplaySession);
+    CsrProcess = NULL;
+    if (DisplaySession != NULL && DisplaySession == UserGetCurrentSession())
+    {
+        Win32kCallbacks.Callout = VideoPortCallout;
+        CsrProcess = DisplaySession->CsrProcess;
+        if (CsrProcess == PsGetCurrentProcess())
+            CsrProcess = NULL;
+        if (CsrProcess != NULL)
+        {
+            ObReferenceObject(CsrProcess);
+            KeStackAttachProcess(&CsrProcess->Pcb, &ApcState);
+        }
+    }
     Status = (NTSTATUS)EngDeviceIoControl((HANDLE)pDeviceObject,
                                           IOCTL_VIDEO_INIT_WIN32K_CALLBACKS,
                                           &Win32kCallbacks,
@@ -803,6 +874,11 @@ EngpRegisterGraphicsDevice(
                                           &Win32kCallbacks,
                                           sizeof(Win32kCallbacks),
                                           &ulReturn);
+    if (CsrProcess != NULL)
+    {
+        KeUnstackDetachProcess(&ApcState);
+        ObDereferenceObject(CsrProcess);
+    }
     if (Status != ERROR_SUCCESS)
     {
         ERR("EngDeviceIoControl(0x%p, IOCTL_VIDEO_INIT_WIN32K_CALLBACKS) failed, Status 0x%lx\n",

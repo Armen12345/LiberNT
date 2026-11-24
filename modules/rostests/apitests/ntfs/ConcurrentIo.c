@@ -425,6 +425,167 @@ MeasureVolume(_In_ BOOL Append, _In_ BOOL Fresh)
     DeleteFileW(SmallPath);
 }
 
+#define GAP_SIZE    (16 * 1024 * 1024)
+#define GAP_VIEW    (64 * 1024)
+#define GAP_PAGE    4096
+
+typedef struct _GAP_WRITER
+{
+    WCHAR Path[MAX_PATH];
+    HANDLE Ready;
+    LONGLONG Ticks;
+    DWORD Error;
+} GAP_WRITER, *PGAP_WRITER;
+
+static DWORD
+CALLBACK
+GapWriterThread(_In_ PVOID Parameter)
+{
+    PGAP_WRITER Writer = Parameter;
+    LARGE_INTEGER Size, Before, After;
+    HANDLE File, Section = NULL;
+    PUCHAR View = NULL;
+
+    File = CreateFileW(Writer->Path, GENERIC_READ | GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                       FILE_ATTRIBUTE_NORMAL, NULL);
+    if (File == INVALID_HANDLE_VALUE)
+    {
+        Writer->Error = GetLastError();
+        SetEvent(Writer->Ready);
+        return 0;
+    }
+
+    Size.QuadPart = GAP_SIZE;
+    if (!SetFilePointerEx(File, Size, NULL, FILE_BEGIN) || !SetEndOfFile(File))
+        Writer->Error = GetLastError();
+    if (Writer->Error == ERROR_SUCCESS)
+    {
+        Section = CreateFileMappingW(File, NULL, PAGE_READWRITE, 0, 0, NULL);
+        if (Section == NULL)
+            Writer->Error = GetLastError();
+    }
+    if (Section != NULL)
+    {
+        View = MapViewOfFile(Section, FILE_MAP_WRITE, 0, GAP_SIZE - GAP_VIEW, GAP_VIEW);
+        if (View == NULL)
+            Writer->Error = GetLastError();
+    }
+    if (View != NULL)
+    {
+        FillMemory(View + GAP_VIEW - GAP_PAGE, GAP_PAGE, 0x5A);
+        SetEvent(Writer->Ready);
+        QueryPerformanceCounter(&Before);
+        if (!FlushViewOfFile(View + GAP_VIEW - GAP_PAGE, GAP_PAGE))
+            Writer->Error = GetLastError();
+        QueryPerformanceCounter(&After);
+        Writer->Ticks = After.QuadPart - Before.QuadPart;
+        UnmapViewOfFile(View);
+    }
+    SetEvent(Writer->Ready);
+    if (Section != NULL)
+        CloseHandle(Section);
+    CloseHandle(File);
+    return 0;
+}
+
+/* A page flushed far past the valid data length makes the filesystem zero everything below it */
+static VOID
+MeasureGap(VOID)
+{
+    WCHAR SmallPath[MAX_PATH];
+    GAP_WRITER Writer;
+    HANDLE Thread;
+    LONGLONG Idle = 0, Worst = 0;
+    ULONG Opens = 0;
+    DWORD Start;
+
+    StringCchPrintfW(SmallPath, MAX_PATH, L"%sconcio_small.dat", VolumeRoot);
+    StringCchPrintfW(Writer.Path, MAX_PATH, L"%sconcio_gap.dat", VolumeRoot);
+
+    if (!MakeFile(SmallPath, 4096))
+    {
+        skip(FALSE, "could not lay down %ls: %lu\n", SmallPath, GetLastError());
+        return;
+    }
+    if (!QueryRound(SmallPath, &Idle) || !QueryRound(SmallPath, &Idle))
+    {
+        ok(FALSE, "the unloaded query round did not finish\n");
+        DeleteFileW(SmallPath);
+        return;
+    }
+
+    Writer.Ready = CreateEventW(NULL, TRUE, FALSE, NULL);
+    Writer.Ticks = 0;
+    Writer.Error = ERROR_SUCCESS;
+    if (Writer.Ready == NULL)
+    {
+        skip(FALSE, "CreateEventW failed: %lu\n", GetLastError());
+        DeleteFileW(SmallPath);
+        return;
+    }
+    Thread = CreateThread(NULL, 0, GapWriterThread, &Writer, 0, NULL);
+    if (Thread == NULL)
+    {
+        skip(FALSE, "CreateThread failed: %lu\n", GetLastError());
+        CloseHandle(Writer.Ready);
+        DeleteFileW(SmallPath);
+        return;
+    }
+
+    if (WaitForSingleObject(Writer.Ready, ROUND_LIMIT_MS) != WAIT_OBJECT_0)
+    {
+        ok(FALSE, "the gap writer never reached its flush\n");
+    }
+    else
+    {
+        Start = GetTickCount();
+        while (WaitForSingleObject(Thread, 0) == WAIT_TIMEOUT && GetTickCount() - Start < ROUND_LIMIT_MS)
+        {
+            LARGE_INTEGER Before, After;
+            HANDLE File;
+
+            QueryPerformanceCounter(&Before);
+            File = CreateFileW(SmallPath, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                               OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+            QueryPerformanceCounter(&After);
+            if (File == INVALID_HANDLE_VALUE)
+            {
+                ok(FALSE, "opening %ls failed: %lu\n", SmallPath, GetLastError());
+                break;
+            }
+            CloseHandle(File);
+            Worst = max(Worst, After.QuadPart - Before.QuadPart);
+            Opens++;
+        }
+    }
+
+    ok(WaitForSingleObject(Thread, ROUND_LIMIT_MS) == WAIT_OBJECT_0,
+       "the gap flush did not finish within %u ms\n", ROUND_LIMIT_MS);
+    ok_eq_hex(Writer.Error, ERROR_SUCCESS);
+
+    trace("gap: open %I64d us idle, at most %I64d us over %lu opens while a %u KB zero fill of %I64d us runs\n",
+          Microseconds(Idle), Microseconds(Worst), Opens, GAP_SIZE / 1024, Microseconds(Writer.Ticks));
+    Report("CONCIO gap open idle %I64d us worst %I64d us opens %lu flush %I64d us\n",
+           Microseconds(Idle), Microseconds(Worst), Opens, Microseconds(Writer.Ticks));
+
+    if (Writer.Ticks > 0 && Opens != 0)
+    {
+        ok(Worst * 2 < Writer.Ticks,
+           "opening a file took up to %I64d us beside a %I64d us flush that zero-fills another file's gap "
+           "(%I64d us with the volume idle), so it waited for the zero fill\n",
+           Microseconds(Worst), Microseconds(Writer.Ticks), Microseconds(Idle));
+    }
+    else
+    {
+        skip(FALSE, "the gap flush produced no timed overlap\n");
+    }
+
+    CloseHandle(Thread);
+    CloseHandle(Writer.Ready);
+    DeleteFileW(Writer.Path);
+    DeleteFileW(SmallPath);
+}
+
 START_TEST(ConcurrentIo)
 {
     LARGE_INTEGER Counter;
@@ -446,4 +607,112 @@ START_TEST(ConcurrentIo)
     MeasureVolume(FALSE, FALSE);
     MeasureVolume(TRUE, FALSE);
     MeasureVolume(FALSE, TRUE);
+    MeasureGap();
+}
+
+#define RACE_FILES 16
+#define RACE_WAIT_MS 10000
+
+typedef struct
+{
+    PCWSTR Directory;
+    HANDLE Start;
+    HANDLE Ready;
+    BYTE Id;
+    DWORD Results[RACE_FILES];
+} CREATE_WORKER;
+
+static DWORD WINAPI
+CreateSameNames(PVOID Context)
+{
+    CREATE_WORKER *Worker = Context;
+    WCHAR Path[MAX_PATH];
+    DWORD i, Bytes;
+
+    SetEvent(Worker->Ready);
+    if (WaitForSingleObject(Worker->Start, RACE_WAIT_MS) != WAIT_OBJECT_0)
+        return ERROR_TIMEOUT;
+    for (i = 0; i < RACE_FILES; ++i)
+    {
+        HANDLE File;
+        StringCchPrintfW(Path, ARRAYSIZE(Path), L"%ls\\%u.bin", Worker->Directory, i);
+        File = CreateFileW(Path, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, CREATE_NEW, 0, NULL);
+        if (File == INVALID_HANDLE_VALUE)
+        {
+            Worker->Results[i] = GetLastError();
+            continue;
+        }
+        Worker->Results[i] = WriteFile(File, &Worker->Id, 1, &Bytes, NULL) && Bytes == 1 ? ERROR_SUCCESS : ERROR_WRITE_FAULT;
+        CloseHandle(File);
+    }
+    return 0;
+}
+
+START_TEST(CreateRace)
+{
+    WCHAR Directory[MAX_PATH], Path[MAX_PATH];
+    CREATE_WORKER Workers[2] = {0};
+    HANDLE Threads[2] = {NULL}, Ready[2] = {NULL}, Start;
+    DWORD i, Bytes, Count = 0;
+
+    if (!FindTestVolume())
+    {
+        skip("no NTFS volume\n");
+        return;
+    }
+    if (!GetTempFileNameW(VolumeRoot, L"mft", 0, Directory) || !DeleteFileW(Directory) || !CreateDirectoryW(Directory, NULL))
+    {
+        ok(FALSE, "creating test directory failed: %lu\n", GetLastError());
+        return;
+    }
+    Start = CreateEventW(NULL, TRUE, FALSE, NULL);
+    ok(Start != NULL, "creating start event failed\n");
+    for (i = 0; Start && i < ARRAYSIZE(Workers); ++i)
+    {
+        Workers[i].Id = (BYTE)(i + 1);
+        Workers[i].Directory = Directory;
+        Workers[i].Start = Start;
+        Ready[i] = Workers[i].Ready = CreateEventW(NULL, TRUE, FALSE, NULL);
+        if (!Ready[i])
+            break;
+        Threads[i] = CreateThread(NULL, 0, CreateSameNames, &Workers[i], 0, NULL);
+        if (!Threads[i])
+            break;
+        ++Count;
+    }
+    ok(Count == 2, "started %lu creators\n", Count);
+    if (Count)
+    {
+        ok(WaitForMultipleObjects(Count, Ready, TRUE, RACE_WAIT_MS) == WAIT_OBJECT_0, "creators did not start\n");
+        SetEvent(Start);
+        ok(WaitForMultipleObjects(Count, Threads, TRUE, RACE_WAIT_MS) == WAIT_OBJECT_0, "creators did not finish\n");
+    }
+    for (i = 0; Count && i < RACE_FILES; ++i)
+    {
+        HANDLE File;
+        BYTE Data[2];
+        DWORD Winner = Workers[0].Results[i] == ERROR_SUCCESS ? 0 : 1;
+        StringCchPrintfW(Path, ARRAYSIZE(Path), L"%ls\\%u.bin", Directory, i);
+        if (Count == 2)
+        {
+            ok(Workers[Winner].Results[i] == ERROR_SUCCESS && Workers[1 - Winner].Results[i] == ERROR_FILE_EXISTS,
+               "file %lu create results %lu/%lu\n", i, Workers[0].Results[i], Workers[1].Results[i]);
+            File = CreateFileW(Path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+            ok(File != INVALID_HANDLE_VALUE, "reopening file %lu failed: %lu\n", i, GetLastError());
+            if (File != INVALID_HANDLE_VALUE)
+            {
+                ok(ReadFile(File, Data, sizeof(Data), &Bytes, NULL) && Bytes == 1 && Data[0] == Workers[Winner].Id,
+                   "file %lu lost its creator's data\n", i);
+                CloseHandle(File);
+            }
+        }
+        DeleteFileW(Path);
+    }
+    for (i = 0; i < ARRAYSIZE(Workers); ++i)
+    {
+        if (Threads[i]) CloseHandle(Threads[i]);
+        if (Ready[i]) CloseHandle(Ready[i]);
+    }
+    if (Start) CloseHandle(Start);
+    ok(RemoveDirectoryW(Directory), "removing test directory failed: %lu\n", GetLastError());
 }

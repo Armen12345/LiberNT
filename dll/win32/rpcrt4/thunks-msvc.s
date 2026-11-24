@@ -1,8 +1,6 @@
 
 #if defined(_M_IX86) || defined(_M_AMD64)
 #include <asm.inc>
-#elif defined(_M_ARM)
-#include <kxarm.h>
 #endif
 
 #ifdef _M_IX86
@@ -10,16 +8,16 @@
 
 THUNK_ENTRY MACRO num:REQ
     ALIGN 4
-    PUBLIC _ObjectStublessClient&num
-    _ObjectStublessClient&num:
+    PUBLIC _ObjectStublessClient&num&@0
+    _ObjectStublessClient&num&@0:
     mov eax, num
     jmp _call_stubless_func
 ENDM
 
 THUNK_ENTRY_VTBL MACRO num:REQ
     ALIGN 4
-    PUBLIC _NdrProxyForwardingFunction&num
-    _NdrProxyForwardingFunction&num:
+    PUBLIC _NdrProxyForwardingFunction&num&@0
+    _NdrProxyForwardingFunction&num&@0:
     mov eax, [esp + 4]
     mov eax, [eax + 16]
     mov [esp + 4], eax
@@ -47,23 +45,6 @@ THUNK_ENTRY_VTBL MACRO num:REQ
     mov rax, [rcx]
     DB 0ffh, 0a0h /* jmp *offset(%rax) */
     DD 8 * num
-ENDM
-
-#elif defined(_M_ARM)
-.code32
-
-// FIXME: this is probably broken
-THUNK_ENTRY MACRO num:REQ
-    ldr ip, .number
-    b.w call_stubless_func
-    .number DB num
-ENDM
-
-THUNK_ENTRY_VTBL MACRO num:REQ
-    ALIGN 4
-    ldr r0, [r0, 10h]
-    ldr ip, [r0]
-    ldr pc, [ip, 4 * num]
 ENDM
 
 #elif defined(_M_ARM64)

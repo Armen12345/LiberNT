@@ -6,8 +6,8 @@ add_definitions(
     -DPNG_BUILD_DLL)
 
 include_directories(
-    ${REACTOS_SOURCE_DIR}/sdk/include/reactos/libs/libpng
-    ${REACTOS_SOURCE_DIR}/sdk/include/reactos/libs/zlib)
+    ${REACTOS_SOURCE_DIR}/sdk/include/libernt/libs/libpng
+    ${REACTOS_SOURCE_DIR}/sdk/include/libernt/libs/zlib)
 
 spec2def(libpng.dll libpng.spec ADD_IMPORTLIB)
 
@@ -30,7 +30,7 @@ list(APPEND SOURCE
 
 add_library(libpng MODULE ${SOURCE} ${CMAKE_CURRENT_BINARY_DIR}/libpng.def)
 set_module_type(libpng win32dll)
-if(ARCH STREQUAL "arm64")
+if(ARCH STREQUAL "arm64" OR ARCH STREQUAL "arm")
     target_compile_definitions(libpng PRIVATE PNG_ARM_NEON_OPT=0)
 endif()
 target_link_libraries(libpng zlib ${PSEH_LIB})

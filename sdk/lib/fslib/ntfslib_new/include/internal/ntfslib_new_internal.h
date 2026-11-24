@@ -231,6 +231,12 @@ NtfsApplyFixup(_Inout_ PNTFSRecordHeader Header,
                _In_ ULONG RecordSize,
                _In_ ULONG BytesPerSector);
 
+BOOLEAN
+NtfsGetFixupStride(_In_ ULONG UpdateSequenceCount,
+                   _In_ ULONG RecordSize,
+                   _In_ ULONG BytesPerSector,
+                   _Out_ PULONG Stride);
+
 NTSTATUS
 NtfsCommitFixup(_Inout_ PNTFSRecordHeader Header,
                 _In_ ULONG RecordSize,
@@ -271,6 +277,7 @@ struct _BTreeKey
 };
 
 /* Private macros */
+#define NTFS_METADATA_BLOCK_SIZE 4096u
 #define BytesPerCluster(Volume) (Volume->BytesPerSector * Volume->SectorsPerCluster)
 
 #define FileRef(Key) ((Key)->Entry->Data.Directory.IndexedFile)
@@ -298,6 +305,12 @@ FileRecordNumber < ((DiskVolume->SectorsPerCluster * DiskVolume->BytesPerSector)
 ((DiskVolume)->ClustersPerIndexRecord < 0 \
  ? (1UL << (-(DiskVolume)->ClustersPerIndexRecord)) \
  : (BytesPerCluster(DiskVolume) * (DiskVolume)->ClustersPerIndexRecord))
+
+// INDEX_ROOT holds the index record size in clusters, or in index VCN units when a record is smaller than a cluster
+#define IndexRootClustersPerIndexRecord(DiskVolume) \
+((UCHAR)((BytesPerIndexRecord(DiskVolume) < BytesPerCluster(DiskVolume)) \
+ ? (BytesPerIndexRecord(DiskVolume) / (DiskVolume)->BytesPerSector) \
+ : (BytesPerIndexRecord(DiskVolume) / BytesPerCluster(DiskVolume))))
 
 #define IsRootFile(Path) \
 ((Path)[0] == L'\0' || ((Path)[0] == L'\\' && (Path)[1] == L'\0'))
@@ -534,18 +547,46 @@ NtfsFlushVolumeContext(_In_opt_ void* Context);
 
 #ifdef __cplusplus
 
-#define NTFS_LOOKUP_SLOTS 8
+#define NTFS_LOOKUP_SLOTS 16
+/* Entries an index-node search collects to bisect; a fuller node is walked in order (a 4 KiB $I30 node holds 46). */
+#define NTFS_INDEX_SEARCH_ENTRIES 64
+
+/* Entry offsets from the node header, kept with a cached node once a search has checked them. */
+typedef struct _NtfsIndexEntryTable
+{
+    BOOLEAN Valid;
+    ULONG Count;
+    ULONG EndOffset;
+    ULONG Offsets[NTFS_INDEX_SEARCH_ENTRIES];
+} NtfsIndexEntryTable, *PNtfsIndexEntryTable;
+
+/* An index name as part of a lookup-cache key; 0 for a name longer than four characters, whose nodes are not cached. */
+static inline ULONGLONG
+NtfsLookupIndexName(_In_ PCWSTR Name)
+{
+    ULONGLONG Key = 0;
+
+    for (ULONG Index = 0; Name[Index]; Index++)
+    {
+        if (Index == 4)
+            return 0;
+        Key = (Key << 16) | (USHORT)Name[Index];
+    }
+    return Key;
+}
 
 typedef struct _NtfsLookupSlot
 {
     PUCHAR Buffer;
     ULONG BufferSize;
-    ULONG Generation;
     ULONGLONG FileReference;
+    ULONGLONG IndexName;
     ULONGLONG VCN;
+    ULONG LastUse;
     BOOLEAN Valid;
     BOOLEAN Busy;
     BOOLEAN Private;
+    NtfsIndexEntryTable Table;
 } NtfsLookupSlot, *PNtfsLookupSlot;
 
 typedef class Volume
@@ -565,6 +606,8 @@ public:
     BOOLEAN IsReadOnly = FALSE;
     BOOLEAN ShowMetadataFiles = FALSE;
     BOOLEAN Generate8dot3Names = FALSE;
+    /* Zero until $MFT record 0 is read; new records follow it. */
+    ULONG FixupStride = 0;
 
     /*
      * Where to begin the free-cluster search. Without it every allocation
@@ -598,15 +641,47 @@ public:
     PUCHAR IndexWorkBuffer = NULL;
     ULONG IndexWorkBufferSize = 0;
 
-    ULONG IndexEditGeneration = 0;
+    /* Cached index nodes by file, index name and VCN; each write replaces its copy and each free drops it. */
     NtfsLookupSlot LookupSlots[NTFS_LOOKUP_SLOTS] = {};
+    ULONG LookupClock = 0;
 
+    /* A slot to use for the node; Hit says it already holds it. Previous, if any, is released first. */
     PNtfsLookupSlot
-    AcquireLookupSlot(_In_ ULONGLONG DirectoryReference,
-                      _In_ ULONG BufferSize);
+    AcquireLookupSlot(_In_ ULONGLONG FileReference,
+                      _In_ ULONGLONG IndexName,
+                      _In_ ULONGLONG Vcn,
+                      _In_ ULONG BufferSize,
+                      _Out_ PBOOLEAN Hit,
+                      _In_opt_ PNtfsLookupSlot Previous = NULL);
 
     void
     ReleaseLookupSlot(_In_ PNtfsLookupSlot Slot);
+
+    BOOLEAN
+    CopyLookupNode(_In_ ULONGLONG FileReference,
+                   _In_ ULONGLONG IndexName,
+                   _In_ ULONGLONG Vcn,
+                   _Out_writes_bytes_(Size) PUCHAR Image,
+                   _In_ ULONG Size);
+
+    /* A slot for the node about to be written, every older copy dropped; NULL when none is free. */
+    PNtfsLookupSlot
+    BeginLookupStore(_In_ ULONGLONG FileReference,
+                     _In_ ULONGLONG IndexName,
+                     _In_ ULONGLONG Vcn,
+                     _In_ ULONG Size);
+
+    void
+    EndLookupStore(_In_ PNtfsLookupSlot Slot,
+                   _In_ BOOLEAN Valid);
+
+    void
+    InvalidateLookupNode(_In_ ULONGLONG FileReference,
+                         _In_ ULONGLONG IndexName,
+                         _In_ ULONGLONG Vcn);
+
+    void
+    ForgetLookupNodes();
 
     /* Free list of record-sized buffers. Every parsed record allocated and
      * freed 1 KB of pool; recycling them needs its own lock because records
@@ -809,9 +884,8 @@ public:
      * @return
      * STATUS_SUCCESS if successful.
      */
-    NTSTATUS WriteVolume(_In_    ULONGLONG Offset,
-                         _In_    ULONG Length,
-                         _Inout_ PUCHAR Buffer);
+    NTSTATUS WriteVolume(_In_ ULONGLONG Offset, _In_ ULONG Length, _Inout_ PUCHAR Buffer,
+                         _In_ NTFS_WRITE_VOLUME_ROUTINE *Write = NtfsWriteVolumeContext);
 
     NTSTATUS FlushVolume();
 
@@ -948,6 +1022,17 @@ NtfsFileNameEaSize(_In_ const FileNameEx *FileName)
     return (ULONG)FileName->Extended.EAInfo.PackedEASize + FileName->Extended.EAInfo.Padding;
 }
 
+BOOLEAN
+ValidateSecurityDescriptor(_In_ const UCHAR* Descriptor,
+                           _In_ ULONG DescriptorLength);
+
+/* Windows records a resident stream's allocation as its length rounded up to 8. */
+inline ULONGLONG
+NtfsResidentAllocatedSize(_In_ ULONGLONG DataLength)
+{
+    return (DataLength + 7) & ~(ULONGLONG)7;
+}
+
 typedef class FileRecord
 {
 public:
@@ -1011,6 +1096,11 @@ public:
         _In_reads_(UpdateCount)
             const NtfsExtendedAttributeUpdate* Updates,
         _In_ ULONG UpdateCount);
+    NTSTATUS InitializeExtendedAttributes(
+        _In_reads_(UpdateCount)
+            const NtfsExtendedAttributeUpdate* Updates,
+        _In_ ULONG UpdateCount,
+        _Out_ PULONG EaInformation);
     NTSTATUS
     SetSecurityDescriptor(
         _In_reads_bytes_(BufferLength) const UCHAR* Buffer,
@@ -1058,8 +1148,17 @@ public:
     UINT32
     GetAutomaticTimestampMask() const;
 
+    void
+    DeferDirectoryTimes(_In_ BOOLEAN Defer);
+
     NTSTATUS
     UpdateAutomaticTimestamps(_In_ UINT32 Fields);
+
+    NTSTATUS
+    DeferFileNameUpdates(_In_ BOOLEAN Defer);
+
+    NTSTATUS
+    FlushFileNameUpdates();
 
     NTSTATUS
     TouchDirectory();
@@ -1084,7 +1183,8 @@ public:
     NTSTATUS
     SetFileDataSize(_In_ AttributeType AttrType,
                     _In_opt_ PWSTR StreamName,
-                    _In_ ULONGLONG NewSize);
+                    _In_ ULONGLONG NewSize,
+                    _In_ ULONGLONG AllocationFloor = 0);
 
     NTSTATUS SetFileValidDataLength(_In_ AttributeType AttrType, _In_opt_ PWSTR StreamName, _In_ ULONGLONG NewValidDataLength);
 
@@ -1139,6 +1239,10 @@ public:
         _Inout_ PULONG StreamCount);
 
     NTSTATUS
+    WriteResident(_In_ PUCHAR Buffer, _In_ ULONG Length, _In_ ULONGLONG Offset,
+                  _In_ NTFS_TRANSFER_RESIDENT_WRITE *Transfer, _In_ void *Context, _Out_ PBOOLEAN Handled);
+
+    NTSTATUS
     UpdateResidentData(_In_ PAttribute TargetAttribute,
                        _In_ PUCHAR Buffer,
                        _In_ PULONG Length,
@@ -1161,8 +1265,7 @@ public:
     GetAllocationSignature();
 
     NTSTATUS
-    GetRecordDiskRange(_Out_ PULONGLONG Offset,
-                       _Out_ PULONG Length);
+    GetRecordDiskRange(_Out_ PULONGLONG Offset, _Out_ PULONG Length, _In_opt_ PAttribute Target = NULL);
 
 private:
     friend class Directory;
@@ -1178,6 +1281,14 @@ private:
     ULONG AttributeListLength = 0;
     UINT32 AutomaticTimestampMask =
         NTFS_AUTOMATIC_TIMESTAMP_FIELDS;
+    BOOLEAN FileNameUpdatesDeferred = FALSE;
+    BOOLEAN DirectoryTimesDeferred = FALSE;
+    UINT32 PendingFileNameFields = 0;
+    ULONGLONG PendingAllocatedSize = 0;
+    ULONGLONG PendingDataSize = 0;
+    ULONG PendingEaInformation = 0;
+    ULONG PendingReparseTag = 0;
+    ULONG PendingStorageFlags = 0;
     UCHAR WofProbeState = 0; /* 0 unknown, 1 absent/non-file, 2 present */
     ULONG WofAlgorithm = 0;
     ULONG WofChunkSize = 0;
@@ -1282,7 +1393,9 @@ private:
         _In_ ULONG NameLength,
         _In_ BOOLEAN IsDirectory,
         _In_ ULONG FileAttributes,
-        _Out_ PFileNameEx* CreatedName);
+        _Out_ PFileNameEx* CreatedName,
+        _In_opt_ const UCHAR* SecurityDescriptor = NULL,
+        _In_ ULONG SecurityDescriptorLength = 0);
 
     NTSTATUS
     ReplaceListedExtendedAttributes(
@@ -1422,7 +1535,8 @@ private:
                         _In_ ULONG Length,
                         _In_ ULONGLONG Offset,
                         _In_ ULONGLONG NewDataSize,
-                        _In_ ULONGLONG RequestedAllocationSize);
+                        _In_ ULONGLONG RequestedAllocationSize,
+                        _In_opt_ NTFS_TRANSFER_RESIDENT_WRITE *Transfer = NULL, _In_opt_ void *Context = NULL);
 
     NTSTATUS
     ExtendNonResidentData(_In_ PAttribute TargetAttribute,
@@ -1430,9 +1544,6 @@ private:
                           _In_ ULONG Length,
                           _In_ ULONGLONG Offset);
 
-    NTSTATUS
-    ResizeNonResidentData(_In_ PAttribute TargetAttribute,
-                          _In_ ULONGLONG NewDataSize);
 
     NTSTATUS
     ResizeSparseData(_In_ PAttribute TargetAttribute,
@@ -1607,7 +1718,33 @@ NtfsFindIndexInsertionPoint(
     _Out_ PULONG InsertionOffset,
     _Out_ PULONGLONG ChildVcn,
     _Out_ PBOOLEAN Descend,
-    _Out_opt_ PBOOLEAN FoundExact = NULL);
+    _Out_opt_ PBOOLEAN FoundExact = NULL,
+    _In_opt_ PNtfsIndexEntryTable Table = NULL);
+
+/*
+ * Holds the node in a lookup slot, reading it on a miss. *Slot is released first and on return holds the
+ * slot to read the node from, for the caller to release; the node in it must not be changed.
+ */
+NTSTATUS
+PinIndexNode(
+    _In_ PVolume DiskVolume,
+    _In_ PFileRecord DirectoryFile,
+    _In_ PCWSTR IndexName,
+    _In_ ULONG RecordSize,
+    _In_ ULONGLONG AllocationUnit,
+    _In_ ULONGLONG Vcn,
+    _Inout_ PNtfsLookupSlot* Slot);
+
+/* Writes one index node; Image is in memory form and leaves with its update sequence applied. */
+NTSTATUS
+WriteIndexNode(
+    _In_ PVolume DiskVolume,
+    _In_ PFileRecord DirectoryFile,
+    _In_ PCWSTR IndexName,
+    _In_ ULONGLONG Vcn,
+    _In_ ULONGLONG AllocationUnit,
+    _In_ ULONG RecordSize,
+    _Inout_updates_bytes_(RecordSize) PUCHAR Image);
 
 typedef class Directory : BTree
 {
@@ -1641,6 +1778,9 @@ public:
     NTSTATUS
     GetNextEntry(_In_ BOOLEAN RestartScan,
                  _Out_ PNtfsDirectoryEntry Entry);
+
+    NTSTATUS
+    VisitNames(PFileRecord File, PNtfsDirectoryNameCallback Callback, void* Context);
 
     // ./editdir.cpp
     NTSTATUS
@@ -1732,6 +1872,16 @@ private:
         _In_ BOOLEAN ListInternal,
         _In_ ULONG RecordSize,
         _In_ ULONGLONG AllocationUnit);
+
+    static NTSTATUS
+    PlaceIndexAllocationInExtension(
+        _In_ PVolume DiskVolume,
+        _In_ PFileRecord DirectoryFile,
+        _In_ PCWSTR IndexName,
+        _In_ PUCHAR Image,
+        _In_ ULONG RecordSize,
+        _In_reads_bytes_(RootValueLength) PUCHAR RootValue,
+        _In_ ULONG RootValueLength);
 
     NTSTATUS
     ReleaseEmptyIndexNode(
@@ -1850,6 +2000,9 @@ public:
     WriteFileRecordToMFT(_In_ PFileRecord File);
 
     NTSTATUS
+    FindAllocationCandidate(_Out_ PULONGLONG Number);
+
+    NTSTATUS
     GetFileRecordDiskOffset(_In_ ULONGLONG RecordNumber,
                             _Out_ PULONGLONG DiskOffset);
 
@@ -1908,7 +2061,9 @@ public:
         _In_ ULONG FileAttributes,
         _Out_ PFileRecord* File,
         _In_opt_ PCWSTR ShortName = NULL,
-        _In_ ULONG ShortNameLength = 0);
+        _In_ ULONG ShortNameLength = 0,
+        _In_opt_ const UCHAR* SecurityDescriptor = NULL,
+        _In_ ULONG SecurityDescriptorLength = 0);
 
     NTSTATUS
     CreateFileInDirectory(
@@ -1920,7 +2075,11 @@ public:
         _In_ BOOLEAN NameKnownMissing,
         _Out_ PFileRecord* File,
         _In_opt_ PCWSTR PreferredShortName = NULL,
-        _In_ ULONG PreferredShortNameLength = 0);
+        _In_ ULONG PreferredShortNameLength = 0,
+        _In_opt_ const UCHAR* SecurityDescriptor = NULL,
+        _In_ ULONG SecurityDescriptorLength = 0,
+        _In_reads_opt_(EaCount) const NtfsExtendedAttributeUpdate* Eas = NULL,
+        _In_ ULONG EaCount = 0);
 
     // ./namespace.cpp
     NTSTATUS
@@ -1931,6 +2090,29 @@ public:
         _In_ BOOLEAN CanDeleteRecord = TRUE,
         _Out_opt_ PBOOLEAN RecordDeleted = NULL,
         _In_ BOOLEAN KeepUnlinkedRecord = FALSE);
+
+    NTSTATUS
+    DeleteFileInDirectory(
+        _Inout_ PFileRecord Parent,
+        _In_reads_(NameLength) PWCHAR Name,
+        _In_ ULONG NameLength,
+        _In_ BOOLEAN RemoveDirectory,
+        _In_opt_ PFileRecord CanonicalRecord,
+        _In_ BOOLEAN CanDeleteRecord,
+        _Out_opt_ PBOOLEAN RecordDeleted,
+        _In_ BOOLEAN KeepUnlinkedRecord);
+
+    NTSTATUS
+    DeleteLookedUpChild(
+        _Inout_ PFileRecord Parent,
+        _Inout_ PFileRecord Child,
+        _In_reads_(NameLength) PWCHAR Name,
+        _In_ ULONG NameLength,
+        _In_ BOOLEAN RemoveDirectory,
+        _In_opt_ PFileRecord CanonicalRecord,
+        _In_ BOOLEAN CanDeleteRecord,
+        _Out_opt_ PBOOLEAN RecordDeleted,
+        _In_ BOOLEAN KeepUnlinkedRecord);
 
     NTSTATUS
     DeleteUnlinkedFile(
@@ -2015,6 +2197,26 @@ private:
         _Out_ PULONGLONG ChildReference,
         _Out_ PWCHAR* Name,
         _Out_ PULONG NameLength);
+
+    NTSTATUS
+    LookupChildInParent(
+        _In_ PFileRecord Parent,
+        _In_ PWCHAR Name,
+        _Out_ PFileRecord* Child,
+        _Out_ PULONGLONG ChildReference);
+
+    NTSTATUS
+    DeleteChild(
+        _Inout_ PFileRecord Parent,
+        _Inout_ PFileRecord Child,
+        _In_ ULONGLONG ChildReference,
+        _In_reads_(NameLength) PWCHAR Name,
+        _In_ ULONG NameLength,
+        _In_ BOOLEAN RemoveDirectory,
+        _In_opt_ PFileRecord CanonicalRecord,
+        _In_ BOOLEAN CanDeleteRecord,
+        _Out_opt_ PBOOLEAN RecordDeleted,
+        _In_ BOOLEAN KeepUnlinkedRecord);
 
     NTSTATUS
     SplitAndResolveParent(

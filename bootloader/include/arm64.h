@@ -38,7 +38,6 @@ VOID Arm64InstallAppleSmbios(VOID);
 VOID Arm64StopFirmwareWatchdog(VOID);
 BOOLEAN Arm64MapVirtualMemory(ULONGLONG VirtualAddress, ULONGLONG PhysicalAddress, ULONGLONG Size, ULONG Attributes);
 VOID StallExecutionProcessor(ULONG Microseconds);
-VOID Arm64DescribeDeviceTreePlatform(VOID);
 
 /* Mapping attribute helpers */
 #define ARM64_MEM_ATTR_DEVICE_nGnRnE   1U
@@ -182,7 +181,7 @@ VOID Arm64RegisterIrqHandler(ULONG IntId, ARM64_IRQ_HANDLER Handler);
 #define ARM64_DMB_ISH()      ARM64_DMB(ISH)
 
 /* ARM64 system register access */
-#include <reactos/arm64/sysreg.h>
+#include <libernt/arm64/sysreg.h>
 
 /* Common system registers */
 #define ARM64_SCTLR_EL1        sctlr_el1

@@ -13,7 +13,7 @@
 #include <win32k.h>
 #include "composition.h"
 #include "dcomposition.h"
-#include <reactos/dwmframe.h>
+#include <libernt/dwmframe.h>
 #include "captioncache.h"
 #if defined(REACTOS_GRAPHICS_DRIVER_MODEL_WDDM)
 #include "drivers/wddm/wddm_bridge.h"
@@ -266,9 +266,6 @@ static PKEVENT         g_ScreenReadEvent = NULL;
 /* The attached compositor process: every DWM entry point is rejected for
  * anyone else (frame metadata + window surfaces are session-global state). */
 static PEPROCESS       g_DwmProcess = NULL;
-static volatile PVOID  g_DwmGpuOutputWindow = NULL;
-static volatile LONG   g_DwmGpuOutputWidth;
-static volatile LONG   g_DwmGpuOutputHeight;
 /* USER lock protects the claim tuple. Keep it separately from the published
  * HWND so forced teardown can disable presents and retry a failed release.
  * The PID is an identity already held by dxgkrnl, not a process to reopen. */
@@ -281,32 +278,48 @@ typedef struct _DWM_GPU_OUTPUT_OWNER
     ULONGLONG Generation;
 } DWM_GPU_OUTPUT_OWNER;
 
-static DWM_GPU_OUTPUT_OWNER g_DwmGpuOutputOwner;
+/* One output per monitor; present paths read a slot without the USER lock, the window last. */
+typedef struct _DWM_GPU_OUTPUT_SLOT
+{
+    volatile PVOID Window;
+    volatile LONG X;
+    volatile LONG Y;
+    volatile LONG Width;
+    volatile LONG Height;
+    volatile LONG VidPnSourceId;
+    DWM_GPU_OUTPUT_OWNER Owner;
+} DWM_GPU_OUTPUT_SLOT;
+
+static DWM_GPU_OUTPUT_SLOT g_DwmGpuOutputs[DWM_MAX_GPU_OUTPUTS];
 static ULONGLONG g_DwmGpuOutputSequence;
 
 static VOID
-IntCompositionClearGpuOutputWindow(VOID)
+IntCompositionClearGpuOutputWindow(_Inout_ DWM_GPU_OUTPUT_SLOT *Slot)
 {
     InterlockedExchangePointer(
-        (PVOID volatile *)&g_DwmGpuOutputWindow, NULL);
-    InterlockedExchange(&g_DwmGpuOutputWidth, 0);
-    InterlockedExchange(&g_DwmGpuOutputHeight, 0);
+        (PVOID volatile *)&Slot->Window, NULL);
+    InterlockedExchange(&Slot->X, 0);
+    InterlockedExchange(&Slot->Y, 0);
+    InterlockedExchange(&Slot->Width, 0);
+    InterlockedExchange(&Slot->Height, 0);
+    InterlockedExchange(&Slot->VidPnSourceId, 0);
 }
 
 static NTSTATUS
-IntCompositionReleaseGpuOutput(_In_ BOOL Force)
+IntCompositionReleaseGpuOutput(_Inout_ DWM_GPU_OUTPUT_SLOT *Slot, _In_ BOOL Force)
 {
     NTSTATUS Status = STATUS_SUCCESS;
 
-    if (g_DwmGpuOutputOwner.Generation != 0)
+    ASSERT(Slot >= &g_DwmGpuOutputs[0] && Slot < &g_DwmGpuOutputs[DWM_MAX_GPU_OUTPUTS]);
+    if (Slot->Owner.Generation != 0)
     {
 #if defined(REACTOS_GRAPHICS_DRIVER_MODEL_WDDM)
         Status = WddmBridgeSetCompositorSourceOwner(
-                     &g_DwmGpuOutputOwner.AdapterLuid,
-                     g_DwmGpuOutputOwner.VidPnSourceId,
-                     g_DwmGpuOutputOwner.ProcessId,
-                     g_DwmGpuOutputOwner.Window,
-                     g_DwmGpuOutputOwner.Generation, 0, 0, FALSE);
+                     &Slot->Owner.AdapterLuid,
+                     Slot->Owner.VidPnSourceId,
+                     Slot->Owner.ProcessId,
+                     Slot->Owner.Window,
+                     Slot->Owner.Generation, 0, 0, FALSE);
 #else
         Status = STATUS_NOT_SUPPORTED;
 #endif
@@ -315,26 +328,72 @@ IntCompositionReleaseGpuOutput(_In_ BOOL Force)
         if (Status == STATUS_NOT_FOUND)
             Status = STATUS_SUCCESS;
         if (NT_SUCCESS(Status))
-            RtlZeroMemory(&g_DwmGpuOutputOwner, sizeof(g_DwmGpuOutputOwner));
+            RtlZeroMemory(&Slot->Owner, sizeof(Slot->Owner));
     }
 
     if (NT_SUCCESS(Status) || Force)
-        IntCompositionClearGpuOutputWindow();
+        IntCompositionClearGpuOutputWindow(Slot);
     return Status;
 }
 
 static NTSTATUS
-IntCompositionClaimGpuOutput(_In_ const DWM_GPU_OUTPUT *Request)
+IntCompositionReleaseGpuOutputs(_In_ BOOL Force)
+{
+    NTSTATUS Status = STATUS_SUCCESS;
+    NTSTATUS OutputStatus;
+    ULONG Index;
+
+    for (Index = 0; Index < DWM_MAX_GPU_OUTPUTS; ++Index)
+    {
+        OutputStatus = IntCompositionReleaseGpuOutput(&g_DwmGpuOutputs[Index], Force);
+        if (NT_SUCCESS(Status))
+            Status = OutputStatus;
+    }
+    return Status;
+}
+
+#if defined(REACTOS_GRAPHICS_DRIVER_MODEL_WDDM)
+/* An output scans out on the VidPn source of the display holding its window. */
+static NTSTATUS
+IntCompositionQueryOutputSource(
+    _In_ PWND Window,
+    _Out_ LUID *AdapterLuid,
+    _Out_ ULONG *VidPnSourceId)
+{
+    PMONITOR Monitor;
+    PPDEVOBJ ppdev;
+    RECTL Rect;
+
+    Rect.left = Window->rcWindow.left;
+    Rect.top = Window->rcWindow.top;
+    Rect.right = Window->rcWindow.right;
+    Rect.bottom = Window->rcWindow.bottom;
+    Monitor = UserMonitorFromRect(&Rect, MONITOR_DEFAULTTOPRIMARY);
+    if (Monitor == NULL || Monitor->hDev == NULL)
+        return STATUS_NOT_FOUND;
+    ppdev = (PPDEVOBJ)Monitor->hDev;
+    if (ppdev->pGraphicsDevice == NULL || ppdev->pGraphicsDevice->szNtDeviceName[0] == UNICODE_NULL)
+        return STATUS_NOT_FOUND;
+    return D3dkmtQueryDisplayDeviceSource(ppdev->pGraphicsDevice->szNtDeviceName, AdapterLuid, VidPnSourceId);
+}
+#endif
+
+static NTSTATUS
+IntCompositionClaimGpuOutput(_In_ const DWM_GPU_OUTPUT *Request, _In_ PWND Window)
 {
 #if defined(REACTOS_GRAPHICS_DRIVER_MODEL_WDDM)
+    DWM_GPU_OUTPUT_SLOT *Slot;
     DWM_GPU_OUTPUT_OWNER Owner;
     NTSTATUS Status;
 
-    if (g_DwmGpuOutputWindow != NULL)
+    ASSERT(Request->Output < DWM_MAX_GPU_OUTPUTS);
+    ASSERT(UserHMGetHandle(Window) == (HWND)(ULONG_PTR)Request->Window);
+    Slot = &g_DwmGpuOutputs[Request->Output];
+    if (Slot->Window != NULL)
     {
-        if ((ULONG_PTR)g_DwmGpuOutputWindow == (ULONG_PTR)Request->Window &&
-            g_DwmGpuOutputWidth == (LONG)Request->Width &&
-            g_DwmGpuOutputHeight == (LONG)Request->Height)
+        if ((ULONG_PTR)Slot->Window == (ULONG_PTR)Request->Window &&
+            Slot->Width == (LONG)Request->Width &&
+            Slot->Height == (LONG)Request->Height)
         {
             return STATUS_SUCCESS;
         }
@@ -343,15 +402,14 @@ IntCompositionClaimGpuOutput(_In_ const DWM_GPU_OUTPUT *Request)
 
     /* Finish an earlier forced teardown before admitting another output.
      * Its adapter/PID must remain the saved values across topology changes. */
-    Status = IntCompositionReleaseGpuOutput(FALSE);
+    Status = IntCompositionReleaseGpuOutput(Slot, FALSE);
     if (!NT_SUCCESS(Status))
         return Status;
     if (g_DwmGpuOutputSequence == MAXULONGLONG)
         return STATUS_INTEGER_OVERFLOW;
 
     RtlZeroMemory(&Owner, sizeof(Owner));
-    Status = WddmBridgeQueryPrimarySource(&Owner.AdapterLuid,
-                                         &Owner.VidPnSourceId);
+    Status = IntCompositionQueryOutputSource(Window, &Owner.AdapterLuid, &Owner.VidPnSourceId);
     if (!NT_SUCCESS(Status))
         return Status;
     Owner.ProcessId = PsGetProcessId(g_DwmProcess);
@@ -364,15 +422,19 @@ IntCompositionClaimGpuOutput(_In_ const DWM_GPU_OUTPUT *Request)
     if (!NT_SUCCESS(Status))
         return Status;
 
-    g_DwmGpuOutputOwner = Owner;
-    InterlockedExchange(&g_DwmGpuOutputWidth, (LONG)Request->Width);
-    InterlockedExchange(&g_DwmGpuOutputHeight, (LONG)Request->Height);
+    Slot->Owner = Owner;
+    InterlockedExchange(&Slot->X, Window->rcWindow.left);
+    InterlockedExchange(&Slot->Y, Window->rcWindow.top);
+    InterlockedExchange(&Slot->Width, (LONG)Request->Width);
+    InterlockedExchange(&Slot->Height, (LONG)Request->Height);
+    InterlockedExchange(&Slot->VidPnSourceId, (LONG)Owner.VidPnSourceId);
     KeMemoryBarrier();
-    InterlockedExchangePointer((PVOID volatile *)&g_DwmGpuOutputWindow,
+    InterlockedExchangePointer((PVOID volatile *)&Slot->Window,
                                (PVOID)Owner.Window);
     return STATUS_SUCCESS;
 #else
     UNREFERENCED_PARAMETER(Request);
+    UNREFERENCED_PARAMETER(Window);
     return STATUS_NOT_SUPPORTED;
 #endif
 }
@@ -1080,8 +1142,15 @@ static ULONGLONG g_BaseUpdateSequence = 0;
 static BOOL
 IntCompositionDeviceBuffers(VOID)
 {
-    return InterlockedCompareExchangePointer(
-               (PVOID volatile *)&g_DwmGpuOutputWindow, NULL, NULL) != NULL;
+    ULONG Index;
+
+    for (Index = 0; Index < DWM_MAX_GPU_OUTPUTS; ++Index)
+    {
+        if (InterlockedCompareExchangePointer(
+                (PVOID volatile *)&g_DwmGpuOutputs[Index].Window, NULL, NULL) != NULL)
+            return TRUE;
+    }
+    return FALSE;
 }
 
 static ULONG
@@ -1591,10 +1660,10 @@ IntCompositionOnWindowDestroy(_In_ PWND Wnd)
     REDIRECT_ENTRY *e;
     ULONG i;
 
-    if (Wnd != NULL &&
-        g_DwmGpuOutputOwner.Window == (ULONG_PTR)UserHMGetHandle(Wnd))
+    for (i = 0; Wnd != NULL && i < DWM_MAX_GPU_OUTPUTS; ++i)
     {
-        (VOID)IntCompositionReleaseGpuOutput(TRUE);
+        if (g_DwmGpuOutputs[i].Owner.Window == (ULONG_PTR)UserHMGetHandle(Wnd))
+            (VOID)IntCompositionReleaseGpuOutput(&g_DwmGpuOutputs[i], TRUE);
     }
 
     /* Drop any GL mark: the PWND may be recycled for an unrelated window. */
@@ -2537,8 +2606,10 @@ IntCompositionCancelRedirectedBltPresent(
         return STATUS_INVALID_PARAMETER;
     }
 
-    Entry->Redirect.GdiAdmittedUpdateId =
-        Entry->Redirect.GdiConsumedUpdateId;
+    /* Retire the cancelled admitted update so future GDI updates
+     * are not blocked by an issued-but-unpublished update. */
+    Entry->Redirect.GdiConsumedUpdateId = Present->UpdateId;
+    Entry->Redirect.GdiAdmittedUpdateId = Present->UpdateId;
     return STATUS_SUCCESS;
 }
 
@@ -2606,17 +2677,22 @@ BOOL
 IntCompositionIsGpuOutputWindow(_In_opt_ PWND Window)
 {
     ULONG_PTR Registered;
+    ULONG Index;
 
     if (Window == NULL || !g_DwmAttached)
         return FALSE;
 
-    Registered = (ULONG_PTR)InterlockedCompareExchangePointer(
-        (PVOID volatile *)&g_DwmGpuOutputWindow, NULL, NULL);
-    return Registered != 0 &&
-           Registered == (ULONG_PTR)UserHMGetHandle(Window);
+    for (Index = 0; Index < DWM_MAX_GPU_OUTPUTS; ++Index)
+    {
+        Registered = (ULONG_PTR)InterlockedCompareExchangePointer(
+            (PVOID volatile *)&g_DwmGpuOutputs[Index].Window, NULL, NULL);
+        if (Registered != 0 && Registered == (ULONG_PTR)UserHMGetHandle(Window))
+            return TRUE;
+    }
+    return FALSE;
 }
 
-/* The attached compositor's registered output window, for that compositor
+/* The attached compositor's primary output window, for that compositor
  * only. */
 HWND
 IntCompositionGetGpuOutputWindow(VOID)
@@ -2624,16 +2700,19 @@ IntCompositionGetGpuOutputWindow(VOID)
     if (!g_DwmAttached || PsGetCurrentProcess() != g_DwmProcess)
         return NULL;
     return (HWND)InterlockedCompareExchangePointer(
-        (PVOID volatile *)&g_DwmGpuOutputWindow, NULL, NULL);
+        (PVOID volatile *)&g_DwmGpuOutputs[0].Window, NULL, NULL);
 }
 
+/* A complete output presented at its place on the desktop; a changed window means a concurrent claim. */
 BOOL
 IntCompositionIsGpuOutputPresent(_In_opt_ HWND Window,
                                  _In_ const RECT *SourceRect,
-                                 _In_ const RECT *DestinationRect)
+                                 _In_ const RECT *DestinationRect,
+                                 _Out_opt_ PULONG VidPnSourceId)
 {
     ULONG_PTR Registered;
-    LONG Width, Height;
+    LONG X, Y, Width, Height, Source;
+    ULONG Index;
 
     if (Window == NULL || SourceRect == NULL || DestinationRect == NULL ||
         !g_DwmAttached || PsGetCurrentProcess() != g_DwmProcess)
@@ -2641,16 +2720,33 @@ IntCompositionIsGpuOutputPresent(_In_opt_ HWND Window,
         return FALSE;
     }
 
-    Registered = (ULONG_PTR)InterlockedCompareExchangePointer(
-        (PVOID volatile *)&g_DwmGpuOutputWindow, NULL, NULL);
-    Width = InterlockedCompareExchange(&g_DwmGpuOutputWidth, 0, 0);
-    Height = InterlockedCompareExchange(&g_DwmGpuOutputHeight, 0, 0);
-    return Registered == (ULONG_PTR)Window && Width > 0 && Height > 0 &&
-           SourceRect->left == 0 && SourceRect->top == 0 &&
-           SourceRect->right == Width && SourceRect->bottom == Height &&
-           DestinationRect->left == 0 && DestinationRect->top == 0 &&
-           DestinationRect->right == Width &&
-           DestinationRect->bottom == Height;
+    for (Index = 0; Index < DWM_MAX_GPU_OUTPUTS; ++Index)
+    {
+        DWM_GPU_OUTPUT_SLOT *Slot = &g_DwmGpuOutputs[Index];
+
+        Registered = (ULONG_PTR)InterlockedCompareExchangePointer(
+            (PVOID volatile *)&Slot->Window, NULL, NULL);
+        if (Registered == 0 || Registered != (ULONG_PTR)Window)
+            continue;
+        X = InterlockedCompareExchange(&Slot->X, 0, 0);
+        Y = InterlockedCompareExchange(&Slot->Y, 0, 0);
+        Width = InterlockedCompareExchange(&Slot->Width, 0, 0);
+        Height = InterlockedCompareExchange(&Slot->Height, 0, 0);
+        Source = InterlockedCompareExchange(&Slot->VidPnSourceId, 0, 0);
+        if (Registered != (ULONG_PTR)InterlockedCompareExchangePointer(
+                (PVOID volatile *)&Slot->Window, NULL, NULL))
+            return FALSE;
+        if (Width <= 0 || Height <= 0 ||
+            SourceRect->left != 0 || SourceRect->top != 0 ||
+            SourceRect->right != Width || SourceRect->bottom != Height ||
+            DestinationRect->left != X || DestinationRect->top != Y ||
+            DestinationRect->right - X != Width || DestinationRect->bottom - Y != Height)
+            return FALSE;
+        if (VidPnSourceId != NULL)
+            *VidPnSourceId = (ULONG)Source;
+        return TRUE;
+    }
+    return FALSE;
 }
 
 VOID
@@ -3830,7 +3926,7 @@ IntCompositionDwmTeardown(VOID)
     g_DwmScreenMirror = FALSE;
     IntCompositionWakeFlushWaiters();
     IntCompositionReleaseFrameSurfaces();
-    (VOID)IntCompositionReleaseGpuOutput(TRUE);
+    (VOID)IntCompositionReleaseGpuOutputs(TRUE);
     /* Damage raised from the GDI finish path holds this same PDEV lock while
      * reading/signaling g_DwmWakeEvent. Clear it before dropping the object
      * reference so KeSetEvent can never race a freed event. */
@@ -3917,13 +4013,15 @@ IntCompositionDwmSetGpuOutput(_In_ PVOID pUser)
     }
     _SEH2_END;
 
-    if (Request.StructSize != sizeof(Request) || Request.Reserved != 0 ||
+    if (Request.StructSize != sizeof(Request) ||
         !g_DwmAttached || PsGetCurrentProcess() != g_DwmProcess)
     {
         return STATUS_ACCESS_DENIED;
     }
+    if (Request.Output >= DWM_MAX_GPU_OUTPUTS)
+        return STATUS_INVALID_PARAMETER;
     if (Request.Window == 0)
-        return IntCompositionReleaseGpuOutput(FALSE);
+        return IntCompositionReleaseGpuOutput(&g_DwmGpuOutputs[Request.Output], FALSE);
     if (Request.Width == 0 || Request.Height == 0 ||
         Request.Width > MAXLONG || Request.Height > MAXLONG ||
         Request.Window > MAXULONG_PTR)
@@ -3938,7 +4036,7 @@ IntCompositionDwmSetGpuOutput(_In_ PVOID pUser)
         return STATUS_ACCESS_DENIED;
     }
 
-    return IntCompositionClaimGpuOutput(&Request);
+    return IntCompositionClaimGpuOutput(&Request, Window);
 }
 
 /*
@@ -5176,6 +5274,84 @@ IntCompositionRestoreDC(_Inout_ PDC pdc)
  * absolutely from the window rects, so re-running it (UserGetDCEx reuse,
  * DceResetActiveDCEs after a move/resize) always yields the current state.
  */
+/* PrintWindow without composition gives the printed top-level window a backing for the length of the call */
+static PWND g_PrintRedirectWnd = NULL;
+
+BOOL
+IntCompositionBeginPrintRedirect(_In_ PWND Wnd)
+{
+    REDIRECT_ENTRY *e;
+
+    ASSERT(UserIsEnteredExclusive());
+    ASSERT(Wnd != NULL);
+
+    if (gbCompositionEnabled || g_PrintRedirectWnd != NULL)
+        return FALSE;
+    if (Wnd == UserGetDesktopWindow() || Wnd->spwndParent != UserGetDesktopWindow())
+        return FALSE;
+
+    e = IntCompositionFind(Wnd);
+    ASSERT(e == NULL);
+    if (e == NULL)
+        e = IntCompositionAlloc(Wnd);
+    if (e == NULL)
+        return FALSE;
+
+    if (IntCompositionEnsureSurface(Wnd, &e->Redirect) == NULL)
+    {
+        IntCompositionFreeSurface(&e->Redirect, FALSE);
+        e->Wnd = NULL;
+        g_RedirectWnds[e - g_Redirects] = NULL;
+        return FALSE;
+    }
+
+    g_PrintRedirectWnd = Wnd;
+    DceResetActiveDCEs(Wnd);
+    return TRUE;
+}
+
+VOID
+IntCompositionEndPrintRedirect(_In_ PWND Wnd)
+{
+    REDIRECT_ENTRY *e;
+
+    ASSERT(UserIsEnteredExclusive());
+    ASSERT(Wnd != NULL);
+    ASSERT(g_PrintRedirectWnd == Wnd);
+
+    g_PrintRedirectWnd = NULL;
+
+    /* Composition switched on during the paint keeps the backing as its own */
+    if (gbCompositionEnabled)
+        return;
+
+    DceUnredirectAllDCs();
+    e = IntCompositionFind(Wnd);
+    if (e != NULL)
+    {
+        IntCompositionFreeSurface(&e->Redirect, FALSE);
+        IntCompositionFreeBlur(e);
+        e->Wnd = NULL;
+        g_RedirectWnds[e - g_Redirects] = NULL;
+    }
+    DceResetActiveDCEs(Wnd);
+}
+
+static PDC
+IntCompositionLockWindowDC(_In_ HDC hDC, _Out_ PBOOL Foreign)
+{
+    PDC pdc = DC_LockDc(hDC);
+
+    *Foreign = FALSE;
+    if (pdc == NULL)
+    {
+        ASSERT(UserIsEnteredExclusive());
+        pdc = DC_LockDcAnyOwner(hDC);
+        *Foreign = (pdc != NULL);
+    }
+    return pdc;
+}
+
 VOID
 IntCompositionRedirectDC(_In_opt_ PWND Wnd, _In_ HDC hDC, _In_ ULONG DcxFlags, _In_opt_ HRGN hrgnClip, _In_ BOOL Revalidate)
 {
@@ -5187,8 +5363,10 @@ IntCompositionRedirectDC(_In_opt_ PWND Wnd, _In_ HDC hDC, _In_ ULONG DcxFlags, _
     PREGION prgn;
     BOOL bRedirect = FALSE;
     BOOL Virtual;
+    BOOL Foreign;
 
-    if (gbCompositionEnabled && Wnd != NULL)
+    if (Wnd != NULL &&
+        (gbCompositionEnabled || (g_PrintRedirectWnd != NULL && IntCompositionTopLevel(Wnd) == g_PrintRedirectWnd)))
     {
         ancestor = IntCompositionTopLevel(Wnd);
         if (ancestor != NULL)
@@ -5221,7 +5399,7 @@ IntCompositionRedirectDC(_In_opt_ PWND Wnd, _In_ HDC hDC, _In_ ULONG DcxFlags, _
         }
     }
 
-    pdc = DC_LockDc(hDC);
+    pdc = IntCompositionLockWindowDC(hDC, &Foreign);
     if (pdc == NULL)
         return;
 
@@ -5230,13 +5408,16 @@ IntCompositionRedirectDC(_In_opt_ PWND Wnd, _In_ HDC hDC, _In_ ULONG DcxFlags, _
         /* A reused DC that was previously redirected (recycled cache entry,
          * or composition disabled meanwhile): restore the primary so the
          * backing reference is not stranded. */
-        if (pdc->fs & DC_REDIRECTION)
+        /* TODO: restore the primary of a DC owned by another process; it keeps its backing until its owner gets it again */
+        if ((pdc->fs & DC_REDIRECTION) && !Foreign)
             IntCompositionRestoreDC(pdc);
         DC_UnlockDc(pdc);
         return;
     }
 
-    if (pdc->dctype != DCTYPE_DIRECT)
+    /* TODO: rebuild the clip of another process's DC with a DCE clip region; that region is the owner's */
+    if (pdc->dctype != DCTYPE_DIRECT ||
+        (Foreign && (DcxFlags & (DCX_INTERSECTRGN | DCX_EXCLUDERGN)) && hrgnClip != NULL))
     {
         DC_UnlockDc(pdc);
         return;
@@ -5375,7 +5556,7 @@ IntCompositionRedirectDC(_In_opt_ PWND Wnd, _In_ HDC hDC, _In_ ULONG DcxFlags, _
     if (IntIsLockUpdateSuppressed(Wnd, DcxFlags))
         REGION_SetRectRgn(prgn, 0, 0, 0, 0);
 
-    pdc = DC_LockDc(hDC);
+    pdc = IntCompositionLockWindowDC(hDC, &Foreign);
     if (pdc == NULL)
     {
         REGION_Delete(prgn);
@@ -5412,9 +5593,13 @@ IntCompositionWatchdog(VOID)
 {
     LONGLONG Now;
     LONGLONG WakePending;
+    ULONG Index;
 
-    if (g_DwmGpuOutputWindow == NULL && g_DwmGpuOutputOwner.Generation != 0)
-        (VOID)IntCompositionReleaseGpuOutput(TRUE);
+    for (Index = 0; Index < DWM_MAX_GPU_OUTPUTS; ++Index)
+    {
+        if (g_DwmGpuOutputs[Index].Window == NULL && g_DwmGpuOutputs[Index].Owner.Generation != 0)
+            (VOID)IntCompositionReleaseGpuOutput(&g_DwmGpuOutputs[Index], TRUE);
+    }
 
     if (!g_DwmAttached || g_DwmProcess == NULL)
         return;

@@ -137,6 +137,10 @@ typedef struct _ADDRESS_FILE {
     BOOLEAN RecvTos;
     BOOLEAN RecvEcn;
     BOOLEAN RecvDstAddr;
+    BOOLEAN RecvPktInfo6;
+    BOOLEAN RecvHopLimit6;
+    BOOLEAN RecvTclass6;
+    BOOLEAN RecvEcn6;
     BOOLEAN NoPortUnreachable;            /* SIO_UDP_CONNRESET turned off */
     DATAGRAM_COMPLETION_ROUTINE Complete; /* Completion routine for delete request */
     PVOID Context;                        /* Delete request context */
@@ -150,6 +154,11 @@ typedef struct _ADDRESS_FILE {
     /* Associated connection or NULL if no associated connection exist */
     BOOLEAN PendingKeepAliveSet;
     BOOLEAN PendingKeepAlive;
+    BOOLEAN PendingKeepAliveValuesSet;
+    ULONG PendingKeepAliveTime;
+    ULONG PendingKeepAliveInterval;
+    BOOLEAN PendingKeepAliveCountSet;
+    ULONG PendingKeepAliveCount;
     BOOLEAN PendingNoDelaySet;
     BOOLEAN PendingNoDelay;
     struct _CONNECTION_ENDPOINT *Listener;

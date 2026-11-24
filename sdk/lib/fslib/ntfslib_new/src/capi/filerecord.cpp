@@ -220,6 +220,36 @@ NtfsFileRecordSetAutomaticTimestampMask(
         SetAutomaticTimestampMask(Fields);
 }
 
+NTSTATUS
+NtfsFileRecordDeferDirectoryTimes(
+    _In_ PNtfsFileRecord Fr,
+    _In_ BOOLEAN Defer)
+{
+    if (!Fr)
+        return STATUS_INVALID_PARAMETER;
+    reinterpret_cast<PFileRecord>(Fr)->DeferDirectoryTimes(Defer);
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS
+NtfsFileRecordDeferFileNameUpdates(
+    _In_ PNtfsFileRecord Fr,
+    _In_ BOOLEAN Defer)
+{
+    if (!Fr)
+        return STATUS_INVALID_PARAMETER;
+    return reinterpret_cast<PFileRecord>(Fr)->DeferFileNameUpdates(Defer);
+}
+
+NTSTATUS
+NtfsFileRecordFlushFileNameUpdates(
+    _In_ PNtfsFileRecord Fr)
+{
+    if (!Fr)
+        return STATUS_INVALID_PARAMETER;
+    return reinterpret_cast<PFileRecord>(Fr)->FlushFileNameUpdates();
+}
+
 UINT32
 NtfsFileRecordGetAutomaticTimestampMask(
     _In_ PNtfsFileRecord Fr)
@@ -472,6 +502,13 @@ NtfsFileRecordSetFileDataSize(
         NewSize);
 }
 
+NTSTATUS
+NtfsFileRecordSetWriteSize(_In_ PNtfsFileRecord File, _In_ AttributeType Type,
+                           _In_opt_ PWSTR Name, _In_ ULONGLONG EndOffset, _In_ ULONGLONG AllocationFloor)
+{
+    return reinterpret_cast<PFileRecord>(File)->SetFileDataSize(Type, Name, EndOffset, AllocationFloor);
+}
+
 ULONGLONG
 NtfsFileRecordGetAllocationSignature(
     _In_ PNtfsFileRecord Fr)
@@ -479,6 +516,13 @@ NtfsFileRecordGetAllocationSignature(
     if (!Fr)
         return 0;
     return reinterpret_cast<PFileRecord>(Fr)->GetAllocationSignature();
+}
+
+NTSTATUS
+NtfsGetAttributeRecordRange(_In_ PNtfsFileRecord File, _In_ PAttribute Attribute,
+                            _Out_ PULONGLONG Offset, _Out_ PULONG Length)
+{
+    return reinterpret_cast<PFileRecord>(File)->GetRecordDiskRange(Offset, Length, Attribute);
 }
 
 NTSTATUS

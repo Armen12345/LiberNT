@@ -51,9 +51,10 @@ KiIdleRunThread(
     NewThread->State = Running;
     KiReleasePrcbLock(Prcb);
 
+    /* The processor the thread is leaving may be held in a rendezvous that waits for this one */
+    _enable();
     KiWaitForThreadSwapOut(NewThread);
 
-    _enable();
     KiSwapContext(APC_LEVEL, OldThread);
     KeLowerIrql(DISPATCH_LEVEL);
 }
@@ -72,7 +73,7 @@ KiIdleSleep(
     Prcb->Sleeping = TRUE;
     KeMemoryBarrier();
 
-    if (KiDpcWorkPending(Prcb) || (Prcb->DpcInterruptRequested != FALSE))
+    if (KiDpcWorkPending(Prcb) || KiIsDpcInterruptRequested(Prcb))
     {
         Prcb->Sleeping = FALSE;
         KiReleasePrcbLock(Prcb);
@@ -83,6 +84,25 @@ KiIdleSleep(
     KiReleasePrcbLock(Prcb);
     Prcb->PowerState.IdleFunction(&Prcb->PowerState);
     Prcb->Sleeping = FALSE;
+}
+
+_Requires_lock_not_held_(Prcb->PrcbLock)
+_Acquires_lock_(Prcb->PrcbLock)
+static
+VOID
+KiIdleAcquirePrcbLock(
+    _Inout_ PKPRCB Prcb)
+{
+    ASSERT(KeGetCurrentIrql() >= DISPATCH_LEVEL);
+
+    /* The holder may be held in a rendezvous that waits for this processor, so the wait takes interrupts */
+    while (InterlockedExchange((PLONG)&Prcb->PrcbLock, 1) != 0)
+    {
+        _enable();
+        while (ReadNoFence((PLONG)&Prcb->PrcbLock) != 0)
+            YieldProcessor();
+        _disable();
+    }
 }
 
 DECLSPEC_NORETURN
@@ -107,7 +127,7 @@ KiIdleLoop(VOID)
         }
 
         _disable();
-        KiAcquirePrcbLock(Prcb);
+        KiIdleAcquirePrcbLock(Prcb);
 
         NewThread = KiIdleTakeNextThread(Prcb);
 

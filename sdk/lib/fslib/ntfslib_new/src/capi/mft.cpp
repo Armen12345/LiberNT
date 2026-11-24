@@ -12,6 +12,19 @@
 extern "C" {
 #endif
 
+BOOLEAN
+NtfsGetAllocationRecordOffset(_In_ PNtfsMasterFileTable Mft, _Out_ PULONGLONG Offset, _Out_ PULONG Size)
+{
+    PMasterFileTable Table = reinterpret_cast<PMasterFileTable>(Mft);
+    ULONGLONG Number;
+    if (!NT_SUCCESS(Table->FindAllocationCandidate(&Number)) ||
+        !NT_SUCCESS(Table->GetFileRecordDiskOffset(Number, Offset)))
+        return FALSE;
+    Table->FreeRecordHint = Number;
+    *Size = Table->FileRecordSize;
+    return TRUE;
+}
+
 NTSTATUS
 NtfsMasterFileTableGetFileRecordFromQuery(
     _In_ PNtfsMasterFileTable Mft,
@@ -165,6 +178,20 @@ NtfsMasterFileTableCreateFile(
     _In_ ULONG FileAttributes,
     _Out_ PNtfsFileRecord* File)
 {
+    return NtfsMasterFileTableCreateFileEx(Mft, Query, QueryLength, IsDirectory, FileAttributes, NULL, 0, File);
+}
+
+NTSTATUS
+NtfsMasterFileTableCreateFileEx(
+    _In_ PNtfsMasterFileTable Mft,
+    _In_reads_(QueryLength) PWCHAR Query,
+    _In_ ULONG QueryLength,
+    _In_ BOOLEAN IsDirectory,
+    _In_ ULONG FileAttributes,
+    _In_opt_ const UCHAR* SecurityDescriptor,
+    _In_ ULONG SecurityDescriptorLength,
+    _Out_ PNtfsFileRecord* File)
+{
     PWCHAR TerminatedQuery;
     NTSTATUS Status;
 
@@ -184,7 +211,11 @@ NtfsMasterFileTableCreateFile(
                 TerminatedQuery,
                 IsDirectory,
                 FileAttributes,
-                reinterpret_cast<PFileRecord*>(File));
+                reinterpret_cast<PFileRecord*>(File),
+                NULL,
+                0,
+                SecurityDescriptor,
+                SecurityDescriptorLength);
     delete[] TerminatedQuery;
     return Status;
 }
@@ -202,6 +233,25 @@ NtfsMasterFileTableCreateFileInDirectory(
     _In_ ULONG ShortNameLength,
     _Out_ PNtfsFileRecord* File)
 {
+    return NtfsMasterFileTableCreateFileInDirectoryEx(Mft, Parent, Name, NameLength, IsDirectory, FileAttributes,
+                                                      NameKnownMissing, ShortName, ShortNameLength, NULL, 0, File);
+}
+
+NTSTATUS
+NtfsMasterFileTableCreateFileInDirectoryEx(
+    _In_ PNtfsMasterFileTable Mft,
+    _In_ PNtfsFileRecord Parent,
+    _In_reads_(NameLength) PWCHAR Name,
+    _In_ ULONG NameLength,
+    _In_ BOOLEAN IsDirectory,
+    _In_ ULONG FileAttributes,
+    _In_ BOOLEAN NameKnownMissing,
+    _In_opt_ PCWSTR ShortName,
+    _In_ ULONG ShortNameLength,
+    _In_opt_ const UCHAR* SecurityDescriptor,
+    _In_ ULONG SecurityDescriptorLength,
+    _Out_ PNtfsFileRecord* File)
+{
     if (!Mft || !Parent || !File)
         return STATUS_INVALID_PARAMETER;
     *File = NULL;
@@ -215,7 +265,42 @@ NtfsMasterFileTableCreateFileInDirectory(
             NameKnownMissing,
             reinterpret_cast<PFileRecord*>(File),
             ShortName,
-            ShortNameLength);
+            ShortNameLength,
+            SecurityDescriptor,
+            SecurityDescriptorLength);
+}
+
+NTSTATUS
+NtfsMasterFileTableCreateFileWithEas(
+    _In_ PNtfsMasterFileTable Mft,
+    _In_ PNtfsFileRecord Parent,
+    _In_reads_(NameLength) PWCHAR Name,
+    _In_ ULONG NameLength,
+    _In_ BOOLEAN IsDirectory,
+    _In_ ULONG FileAttributes,
+    _In_ BOOLEAN NameKnownMissing,
+    _In_reads_opt_(EaCount) const NtfsExtendedAttributeUpdate* Eas,
+    _In_ ULONG EaCount,
+    _Out_ PNtfsFileRecord* File)
+{
+    if (!Mft || !Parent || !File)
+        return STATUS_INVALID_PARAMETER;
+    *File = NULL;
+    return reinterpret_cast<PMasterFileTable>(Mft)->
+        CreateFileInDirectory(
+            reinterpret_cast<PFileRecord>(Parent),
+            Name,
+            NameLength,
+            IsDirectory,
+            FileAttributes,
+            NameKnownMissing,
+            reinterpret_cast<PFileRecord*>(File),
+            NULL,
+            0,
+            NULL,
+            0,
+            Eas,
+            EaCount);
 }
 
 NTSTATUS
@@ -302,6 +387,76 @@ NtfsMasterFileTableUnlinkFile(
                 TRUE);
     delete[] TerminatedQuery;
     return Status;
+}
+
+NTSTATUS
+NtfsMasterFileTableDeleteFileInDirectory(
+    _In_ PNtfsMasterFileTable Mft,
+    _Inout_ PNtfsFileRecord Parent,
+    _In_reads_(NameLength) PWCHAR Name,
+    _In_ ULONG NameLength,
+    _In_ BOOLEAN RemoveDirectory,
+    _In_opt_ PNtfsFileRecord CanonicalRecord,
+    _In_ BOOLEAN CanDeleteRecord,
+    _In_ BOOLEAN KeepUnlinkedRecord,
+    _Out_opt_ PBOOLEAN RecordDeleted)
+{
+    WCHAR TerminatedName[NTFS_MAX_FILE_NAME_LENGTH + 1];
+
+    if (RecordDeleted)
+        *RecordDeleted = FALSE;
+    if (!Mft || !Parent || !Name || NameLength == 0)
+        return STATUS_INVALID_PARAMETER;
+    if (NameLength > NTFS_MAX_FILE_NAME_LENGTH)
+        return STATUS_OBJECT_NAME_INVALID;
+    RtlCopyMemory(TerminatedName, Name, NameLength * sizeof(WCHAR));
+    TerminatedName[NameLength] = 0;
+    return reinterpret_cast<PMasterFileTable>(Mft)->
+        DeleteFileInDirectory(
+            reinterpret_cast<PFileRecord>(Parent),
+            TerminatedName,
+            NameLength,
+            RemoveDirectory,
+            reinterpret_cast<PFileRecord>(CanonicalRecord),
+            CanDeleteRecord,
+            RecordDeleted,
+            KeepUnlinkedRecord);
+}
+
+NTSTATUS
+NtfsMasterFileTableDeleteChild(
+    _In_ PNtfsMasterFileTable Mft,
+    _Inout_ PNtfsFileRecord Parent,
+    _Inout_ PNtfsFileRecord Child,
+    _In_reads_(NameLength) PWCHAR Name,
+    _In_ ULONG NameLength,
+    _In_ BOOLEAN RemoveDirectory,
+    _In_opt_ PNtfsFileRecord CanonicalRecord,
+    _In_ BOOLEAN CanDeleteRecord,
+    _In_ BOOLEAN KeepUnlinkedRecord,
+    _Out_opt_ PBOOLEAN RecordDeleted)
+{
+    WCHAR TerminatedName[NTFS_MAX_FILE_NAME_LENGTH + 1];
+
+    if (RecordDeleted)
+        *RecordDeleted = FALSE;
+    if (!Mft || !Parent || !Child || !Name || NameLength == 0)
+        return STATUS_INVALID_PARAMETER;
+    if (NameLength > NTFS_MAX_FILE_NAME_LENGTH)
+        return STATUS_OBJECT_NAME_INVALID;
+    RtlCopyMemory(TerminatedName, Name, NameLength * sizeof(WCHAR));
+    TerminatedName[NameLength] = 0;
+    return reinterpret_cast<PMasterFileTable>(Mft)->
+        DeleteLookedUpChild(
+            reinterpret_cast<PFileRecord>(Parent),
+            reinterpret_cast<PFileRecord>(Child),
+            TerminatedName,
+            NameLength,
+            RemoveDirectory,
+            reinterpret_cast<PFileRecord>(CanonicalRecord),
+            CanDeleteRecord,
+            RecordDeleted,
+            KeepUnlinkedRecord);
 }
 
 NTSTATUS

@@ -48,7 +48,7 @@ if(USE_DUMMY_PSEH)
 endif()
 
 # Clang implements native SEH for these targets.
-if(ARCH STREQUAL "amd64" OR ARCH STREQUAL "arm64" OR ARCH STREQUAL "riscv64" OR ARCH STREQUAL "ppc")
+if(NOT ARCH STREQUAL "i386")
     set(CLANG_NATIVE_SEH TRUE)
 endif()
 
@@ -60,6 +60,10 @@ if(CLANG_NATIVE_SEH AND NOT USE_DUMMY_PSEH)
     add_compile_options("$<$<AND:$<COMPILE_LANGUAGE:CXX>,$<NOT:$<BOOL:$<TARGET_PROPERTY:WITH_CXX_EXCEPTIONS>>>>:SHELL:-Xclang -fasync-exceptions>")
     if(ARCH STREQUAL "arm64")
         add_compile_options("$<$<COMPILE_LANGUAGE:C,CXX>:SHELL:-mllvm -aarch64-enable-compress-jump-tables=false>")
+    endif()
+    if(ARCH STREQUAL "arm")
+        # FIXME: at -O2 block placement asserts on functions with handlers ("Unexpected block with un-analyzable fallthrough!"); drop this with the compiler fix
+        add_compile_options("$<$<COMPILE_LANGUAGE:C,CXX>:SHELL:-mllvm -disable-block-placement>")
     endif()
 endif()
 
@@ -191,9 +195,6 @@ endif()
 if(ARCH STREQUAL "amd64")
     add_compile_options(-mcx16) # Generate CMPXCHG16
     add_definitions(-U_X86_ -UWIN32)
-elseif(ARCH STREQUAL "arm")
-    add_definitions(-U_UNICODE -UUNICODE)
-    add_definitions(-D__MSVCRT__) # DUBIOUS
 endif()
 
 # Fix build with GLIBCXX + our c++ headers
@@ -303,7 +304,7 @@ if(ARCH STREQUAL "i386")
     set(_rc_target_flag "--target=pe-i386")
 elseif(ARCH STREQUAL "amd64")
     set(_rc_target_flag "--target=pe-x86-64")
-elseif(ARCH STREQUAL "arm64" OR ARCH STREQUAL "riscv64" OR ARCH STREQUAL "ppc")
+else()
     set(_rc_target_flag "--target=${CMAKE_C_COMPILER_TARGET}")
 endif()
 
@@ -341,6 +342,10 @@ function(set_module_type_toolchain MODULE TYPE)
     # Set the PE image version numbers from the NT OS version ReactOS is based on
     target_link_options(${MODULE} PRIVATE
         -Wl,--major-image-version,${_NT_MAJOR} -Wl,--minor-image-version,0${_NT_MINOR} -Wl,--major-os-version,${_NT_MAJOR} -Wl,--minor-os-version,0${_NT_MINOR})
+
+    if(ARCH STREQUAL "i386" AND TYPE IN_LIST KERNEL_MODULE_TYPES)
+        set_property(TARGET ${MODULE} PROPERTY REACTOS_KERNEL_STACK_PROBE chkstk)
+    endif()
 
     if(ARM64EC_RUNTIME AND NOT TYPE IN_LIST KERNEL_MODULE_TYPES)
         add_arm64ec_chpe_support(${MODULE})
@@ -438,14 +443,14 @@ function(add_delay_importlibs _module)
     # placing the delay-load IAT in read-only .rdata and causing access violations.
     # Use regular import libs + LLD's native --delayload flag instead.
     foreach(_lib ${ARGN})
-        get_filename_component(_basename "${_lib}" NAME_WE)
-        target_link_libraries(${_module} lib${_basename})
-        # Determine the DLL filename
-        if("${_lib}" MATCHES "\\.")
+        if("${_lib}" MATCHES "\\.(dll|drv)$")
+            get_filename_component(_basename "${_lib}" NAME_WLE)
             set(_dllname "${_lib}")
         else()
+            set(_basename "${_lib}")
             set(_dllname "${_lib}.dll")
         endif()
+        target_link_libraries(${_module} lib${_basename})
         target_link_options(${_module} PRIVATE "-Wl,--delayload,${_dllname}")
     endforeach()
     target_link_libraries(${_module} delayimp)
@@ -724,6 +729,9 @@ add_library(libgcc INTERFACE)
 target_link_libraries(libgcc INTERFACE ${_clang_rt_builtins} libkernel32)
 if(ARCH STREQUAL "arm64" AND NOT ARM64EC_RUNTIME)
     link_libraries("$<TARGET_PROPERTY:REACTOS_LSE_ATOMICS>")
+endif()
+if(ARCH STREQUAL "i386")
+    link_libraries("$<TARGET_PROPERTY:REACTOS_KERNEL_STACK_PROBE>")
 endif()
 link_libraries(${_clang_rt_builtins})
 add_link_options(-Wl,--allow-multiple-definition)

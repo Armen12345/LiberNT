@@ -7,6 +7,7 @@
 #include "ntfslib_new.h"
 #include "ntfslib_new_internal.h"
 
+
 static BOOLEAN
 IsFileNameCharacterValid(_In_ WCHAR Character)
 {
@@ -324,7 +325,9 @@ MasterFileTable::CreateFile(
     _In_ ULONG FileAttributes,
     _Out_ PFileRecord* File,
     _In_opt_ PCWSTR ShortName,
-    _In_ ULONG ShortNameLength)
+    _In_ ULONG ShortNameLength,
+    _In_opt_ const UCHAR* SecurityDescriptor,
+    _In_ ULONG SecurityDescriptorLength)
 {
     PFileRecord Parent = NULL;
     PWCHAR Name;
@@ -354,7 +357,9 @@ MasterFileTable::CreateFile(
             FALSE,
             File,
             ShortName,
-            ShortNameLength);
+            ShortNameLength,
+            SecurityDescriptor,
+            SecurityDescriptorLength);
     }
     delete Parent;
     return Status;
@@ -370,7 +375,11 @@ MasterFileTable::CreateFileInDirectory(
     _In_ BOOLEAN NameKnownMissing,
     _Out_ PFileRecord* File,
     _In_opt_ PCWSTR PreferredShortName,
-    _In_ ULONG PreferredShortNameLength)
+    _In_ ULONG PreferredShortNameLength,
+    _In_opt_ const UCHAR* SecurityDescriptor,
+    _In_ ULONG SecurityDescriptorLength,
+    _In_reads_opt_(EaCount) const NtfsExtendedAttributeUpdate* Eas,
+    _In_ ULONG EaCount)
 {
     Directory ParentIndex(DiskVolume);
     PFileRecord NewFile = NULL;
@@ -381,10 +390,12 @@ MasterFileTable::CreateFileInDirectory(
     ULONGLONG ExistingReference;
     ULONGLONG FileReference;
     BOOLEAN RecordPublished = FALSE;
+    BOOLEAN EasPending = FALSE;
+    ULONG EaInformation = 0;
     NTSTATUS RollbackStatus;
     NTSTATUS Status;
 
-    if (!File)
+    if (!File || (EaCount != 0 && !Eas))
         return STATUS_INVALID_PARAMETER;
     *File = NULL;
     if (!DiskVolume || !Parent ||
@@ -458,7 +469,9 @@ MasterFileTable::CreateFileInDirectory(
         NameLength,
         IsDirectory,
         FileAttributes,
-        &FileName);
+        &FileName,
+        SecurityDescriptor,
+        SecurityDescriptorLength);
     if (!NT_SUCCESS(Status))
         goto Rollback;
 
@@ -509,6 +522,21 @@ MasterFileTable::CreateFileInDirectory(
         FileName->NameType = NAME_TYPE_WIN32_AND_DOS;
     }
 
+    if (EaCount != 0)
+    {
+        Status = NewFile->InitializeExtendedAttributes(Eas, EaCount, &EaInformation);
+        if (Status == STATUS_BUFFER_TOO_SMALL)
+        {
+            EasPending = TRUE;
+            Status = STATUS_SUCCESS;
+        }
+        if (!NT_SUCCESS(Status))
+            goto Rollback;
+        NtfsSetFileNameEaInformation(FileName, EaInformation);
+        if (ShortValue)
+            NtfsSetFileNameEaInformation(ShortValue, EaInformation);
+    }
+
     Status = WriteFileRecordToMFT(NewFile);
     if (!NT_SUCCESS(Status))
         goto Rollback;
@@ -551,6 +579,38 @@ MasterFileTable::CreateFileInDirectory(
     }
     RecordPublished = TRUE;
 
+    if (EasPending)
+    {
+        Status = NewFile->UpdateExtendedAttributes(Eas, EaCount);
+        if (!NT_SUCCESS(Status))
+        {
+            Directory UndoIndex(DiskVolume);
+            UNICODE_STRING LongName = NtfsMakeCountedUnicodeString(
+                FileName->Name,
+                (USHORT)(FileName->NameLength * sizeof(WCHAR)));
+
+            RollbackStatus = UndoIndex.RemoveFileFromDirectory(
+                Parent,
+                FileReference,
+                &LongName);
+            if (NT_SUCCESS(RollbackStatus) && ShortValue)
+            {
+                Directory UndoShortIndex(DiskVolume);
+                UNICODE_STRING DosName = NtfsMakeCountedUnicodeString(
+                    ShortValue->Name,
+                    (USHORT)(ShortValue->NameLength * sizeof(WCHAR)));
+
+                RollbackStatus = UndoShortIndex.RemoveFileFromDirectory(
+                    Parent,
+                    FileReference,
+                    &DosName);
+            }
+            if (!NT_SUCCESS(RollbackStatus))
+                goto Done;
+            RecordPublished = FALSE;
+            goto Rollback;
+        }
+    }
     *File = NewFile;
     NewFile = NULL;
     Status = STATUS_SUCCESS;

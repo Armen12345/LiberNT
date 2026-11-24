@@ -37,11 +37,13 @@ extern void func_FileStatInformation(void);
 extern void func_arm64_chpe(void);
 extern void func_wow64_startup(void);
 extern void func_wow64_native_process(void);
+extern void func_KnownDlls(void);
 extern void func_LdrEnumResources(void);
 extern void func_LdrFindResource_U(void);
 extern void func_LdrForwarderPath(void);
 extern void func_LdrGetDllHandleByName(void);
 extern void func_LdrLoadDll(void);
+extern void func_LdrModuleEntry(void);
 extern void func_LdrQueryProcessModuleInformation(void);
 extern void func_load_notifications(void);
 extern void func_memmove(void);
@@ -64,6 +66,7 @@ extern void func_NtCompareTokens(void);
 extern void func_NtContinue(void);
 #endif
 #ifdef _M_AMD64
+extern void func_LdrScp(void);
 extern void func_NullGsSelector(void);
 extern void func_RtlRestoreContextConsolidate(void);
 extern void func_RtlVirtualUnwindFragment(void);
@@ -117,6 +120,7 @@ extern void func_NtQueryInformationProcess(void);
 extern void func_NtQueryInformationThread(void);
 extern void func_NtQueryInformationToken(void);
 extern void func_NtQueryKey(void);
+extern void func_ObjectTypeIndex(void);
 extern void func_MemoryImageInformation(void);
 extern void func_NtQueryObject(void);
 extern void func_NtQueryObjectName(void);
@@ -180,6 +184,7 @@ extern void func_RtlGetLengthWithoutLastFullDosOrNtPathElement(void);
 extern void func_RtlGetLengthWithoutTrailingPathSeperators(void);
 extern void func_RtlGetLongestNtPathLength(void);
 extern void func_RtlGetNtProductType(void);
+extern void func_RtlGetVersion(void);
 extern void func_RtlGetProcessHeaps(void);
 extern void func_RtlHeapApis(void);
 extern void func_RtlGetProductInfo(void);
@@ -195,6 +200,7 @@ extern void func_RtlIntSafe(void);
 extern void func_RtlIsNameInExpression(void);
 extern void func_RtlIsNameLegalDOS8Dot3(void);
 extern void func_RtlLocale(void);
+extern void func_RtlLocateExtendedFeature(void);
 extern void func_RtlMemoryStream(void);
 extern void func_PfxPrefixTable(void);
 extern void func_RtlAddressInSectionTable(void);
@@ -291,11 +297,13 @@ const struct test winetest_testlist[] =
     { "DpcBehaviorRegistry",            func_DpcBehaviorRegistry },
     { "FileStatInformation",            func_FileStatInformation },
     { "arm64_chpe",                     func_arm64_chpe },
+    { "KnownDlls",                      func_KnownDlls },
     { "LdrEnumResources",               func_LdrEnumResources },
     { "LdrFindResource_U",              func_LdrFindResource_U },
     { "LdrForwarderPath",               func_LdrForwarderPath },
     { "LdrGetDllHandleByName",          func_LdrGetDllHandleByName },
     { "LdrLoadDll",                     func_LdrLoadDll },
+    { "LdrModuleEntry",                 func_LdrModuleEntry },
     { "LdrQueryProcessModuleInformation", func_LdrQueryProcessModuleInformation },
     { "load_notifications",             func_load_notifications },
     { "memmove",                        func_memmove },
@@ -319,6 +327,7 @@ const struct test winetest_testlist[] =
     { "NtContinue",                     func_NtContinue },
 #endif
 #ifdef _M_AMD64
+    { "LdrScp",                         func_LdrScp },
     { "NullGsSelector",                 func_NullGsSelector },
     { "RtlRestoreContextConsolidate",   func_RtlRestoreContextConsolidate },
     { "RtlVirtualUnwindFragment",       func_RtlVirtualUnwindFragment },
@@ -372,6 +381,7 @@ const struct test winetest_testlist[] =
     { "NtQueryInformationThread",       func_NtQueryInformationThread },
     { "NtQueryInformationToken",        func_NtQueryInformationToken },
     { "NtQueryKey",                     func_NtQueryKey },
+    { "ObjectTypeIndex",                func_ObjectTypeIndex },
     { "NtQueryObject",                  func_NtQueryObject },
     { "NtQueryObjectName",              func_NtQueryObjectName },
     { "MemoryImageInformation",         func_MemoryImageInformation },
@@ -436,6 +446,7 @@ const struct test winetest_testlist[] =
     { "RtlGetLengthWithoutTrailingPathSeperators", func_RtlGetLengthWithoutTrailingPathSeperators },
     { "RtlGetLongestNtPathLength",      func_RtlGetLongestNtPathLength },
     { "RtlGetNtProductType",            func_RtlGetNtProductType },
+    { "RtlGetVersion",                  func_RtlGetVersion },
     { "RtlGetProcessHeaps",             func_RtlGetProcessHeaps },
     { "RtlHeapApis",                    func_RtlHeapApis },
     { "RtlGetProductInfo",              func_RtlGetProductInfo },
@@ -451,6 +462,7 @@ const struct test winetest_testlist[] =
     { "RtlIsNameInExpression",          func_RtlIsNameInExpression},
     { "RtlIsNameLegalDOS8Dot3",         func_RtlIsNameLegalDOS8Dot3 },
     { "RtlLocale",                      func_RtlLocale },
+    { "RtlLocateExtendedFeature",       func_RtlLocateExtendedFeature },
     { "RtlMemoryStream",                func_RtlMemoryStream },
     { "PfxPrefixTable", func_PfxPrefixTable },
     { "RtlAddressInSectionTable", func_RtlAddressInSectionTable },

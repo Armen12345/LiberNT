@@ -1,16 +1,23 @@
 # ntfslib_new Linux/FUSE test driver
 
-This directory builds the existing `ntfslib_new` parser natively on Linux and
-exposes it as a read-only FUSE 3 filesystem. It also provides image-inspection
-and focused mutation commands that do not require FUSE privileges.
+This directory builds the existing `ntfslib_new` core natively on Linux and
+exposes it as a FUSE 3 filesystem, read-only by default and read-write with
+`--writable`. It also provides image-inspection, resize and focused mutation
+commands that do not require FUSE privileges.
 This is a dedicated Linux test build and is not added to ReactOS's top-level
 CMake targets.
 
-The mounted frontend is intentionally read-only and single-threaded. Normal
-inspection opens the image read-only. Explicit mutation probes request write
-access only for one operation; use them only on disposable test images because
-LFS logging and recovery are not implemented. This is a bring-up/test driver,
-not a production replacement for `ntfs3` or `ntfs-3g`.
+The mounted frontend serializes requests to the shared volume, except file
+data that changes no allocation: those reads and writes go to the image
+outside the request lock, and two helper threads drain the request queue
+beside the main one when the kernel has several requests waiting (writeback,
+read-ahead). With a kernel and libfuse supporting FUSE over io_uring, pass
+`-o io_uring` after the mountpoint to use per-CPU request queues instead.
+Normal inspection opens the image
+read-only. Writable mounts and mutation probes have no LFS logging or crash
+recovery; use them on disposable test images or volumes you check afterwards.
+This is a test driver for the shared core, not a production replacement for
+`ntfs3` or `ntfs-3g`.
 
 ## Build
 
@@ -148,13 +155,100 @@ build/ntfslib-linux/fuse/ntfslib_fuse \
 # In another terminal:
 ls -la /tmp/ntfslib-mnt
 fusermount3 -u /tmp/ntfslib-mnt
+
+# Read-write:
+build/ntfslib-linux/fuse/ntfslib_fuse --writable \
+    disk.ntfs /tmp/ntfslib-mnt
 ```
 
-The frontend adds FUSE's `-s` and `-o ro` options automatically. Because the
-backing image is immutable for the lifetime of the mount, it also enables
-kernel page caching and extended entry/attribute cache lifetimes. A block
-device can be supplied instead of an image when the invoking user has read
-access.
+A read-only mount adds FUSE's `-o ro` and, because the image cannot change
+under it, keeps file data in the kernel page cache with long entry and
+attribute lifetimes. A writable mount keeps file data in the kernel page
+cache too, so `write()` and shared mappings of a file stay coherent.
+`--direct-io` sends every read and write straight to the core instead; a
+`write()` can then be lost when another process dirties a shared mapping of
+the same page at the same time. Writable mounts enable writeback caching when
+the kernel supports it. Applications must check `fsync` and `close` for deferred
+write errors, including `ENOSPC`. Use `--writable --write-through` to report
+allocation failures at `write`. With writeback active, setting a regular file’s
+mtime outside the supported NTFS range returns `EOVERFLOW` and preserves its
+previous timestamps. Access times follow relatime; `-o noatime` turns them off,
+`-o strictatime` updates them on every opened read, and the other access-time
+options of mount(8) are accepted. Directory access times are not updated. A block device can be
+supplied instead of an image when the invoking user has access to it.
+
+Three things cut requests on a tree walk. Directories are read without an
+open or a release, each scan tied to the listing it started on. A reader that
+opens the files of a directory in listing order finds the small ones (up to
+128 KiB) already in the page cache: the first is pushed with its open, the
+following ones ahead of the walk; such an open takes the access time whether
+or not it reads. A mount made with the privilege to do so raises its share of
+dirty memory from the 1% the kernel gives a FUSE mount, which otherwise paces
+sequential writes below what the daemon can take.
+
+A second mount of an image, or a tool run against a mounted one, fails with
+`EBUSY`; an image whose daemon is still unmounting is waited for, up to two
+seconds.
+
+## Kernel module
+
+`kernel/` builds the same core into `ntfslib.ko`, a Linux filesystem driver
+(`mount -t ntfslib`), for the cases FUSE cannot make fast: every FUSE request
+costs a round trip to the daemon, and creating or removing a file takes two
+or three of them.
+
+```sh
+make -C sdk/lib/fslib/ntfslib_new/linux/kernel OUT=/path/to/empty/build/dir
+```
+
+It is an early driver: files, directories, rename, truncation, times, page
+cache with delayed write-back and mmap work. Plain cluster-backed files are
+read and written through iomap with large folios; resident, compressed and
+sparse streams go through the core. NTFS keeps one written length per stream:
+blocks past it read as zeros, and write-back zeroes on the device whatever
+lies between the old written length and the block it stores before moving the
+length over it, so a store through a mapping or a write far into a grown file
+never exposes what the clusters held before. Bytes past the end of a file in
+its last block are cleared when that page is mapped and when the file grows,
+as the device only holds zeros there if this driver wrote the block.
+Ownership, mode and device numbers are stored as described below, so files,
+directories, hard links, symbolic links, FIFOs, sockets and device nodes made
+here read the same through the FUSE frontend and ntfs3. Extended attributes,
+sparse files, `O_DIRECT`, `fstrim` and mount options are not implemented. One
+lock serializes the core. It has not been used on real hardware yet.
+
+Listing a directory walks its index once per pass: the names wait with the
+open directory between `getdents` calls, and each name handed out also becomes
+a cached name and inode, so the `stat`, `open` or `unlink` that usually follows
+needs no second index lookup. A directory's change times are written once,
+when it leaves a short list of recently changed directories, at `sync`,
+`fsync` or unmount, and not at all if the directory is removed first; until
+then `stat` reports the pending time.
+
+POSIX ownership, mode and device numbers are kept in the `$LXUID`, `$LXGID`,
+`$LXMOD` and `$LXDEV` extended attributes, as WSL and ntfs3 store them, so
+FIFOs, sockets and device nodes are ordinary records typed by `$LXMOD`.
+Files without them belong to the mounting user. The kernel enforces these
+permissions (FUSE `default_permissions`), as it does for ntfs3, and the
+frontend clears set-user-ID and set-group-ID on writes, truncation,
+preallocation and chown with the rules the Linux VFS applies. Symbolic links are NTFS
+symbolic-link reparse points, and other native EAs appear as `user.` extended
+attributes. Lookups are case-sensitive, while the volume keeps the NTFS rule
+that names differing only in case cannot share a directory.
+
+## Resize a volume
+
+```sh
+build/ntfslib-linux/fuse/ntfslib_fuse --grow disk.ntfs NEW_SECTORS
+build/ntfslib-linux/fuse/ntfslib_fuse --shrink disk.ntfs NEW_SECTORS
+build/ntfslib-linux/fuse/ntfslib_fuse --expand-disk disk.img [PARTITION]
+```
+
+`--grow` refuses a size past the end of the image. `--shrink` first moves
+file data, `$LogFile` and `$MFTMirr` out of the clusters it drops; truncate
+the image afterwards. `--expand-disk` grows the last (or the given) MBR or
+GPT partition of a whole-disk image to the end of the image, then grows its
+volume.
 
 ## Smoke test
 
@@ -256,8 +350,7 @@ incorrect result fails instead of being reported as fast.
   extension record. The core can create an initial list for a full base when
   it can relocate a resident named stream or legacy security descriptor; an
   uncommon record with neither enough header room nor a safely movable
-  attribute still cannot be transformed. Unnamed stream/file creation,
-  directory-index growth, and directory mutation remain unimplemented. An
+  attribute still cannot be transformed. An
   existing list grows transactionally when publishing stream-mapping
   continuation entries. Fragmented list storage is preferentially relocated
   copy-on-write into one complete run before its base-record mapping pairs
@@ -265,8 +358,8 @@ incorrect result fails instead of being reported as fast.
   durable, and bounded incremental growth is the fallback when a contiguous
   replacement is unavailable.
 - An all-`0xff` `$LogFile` is recognized as NTFS's empty/clean form, but there
-  is no journal replay, transaction logging, crash recovery, or safe writable
-  mount.
+  is no journal replay, transaction logging or crash recovery, so a writable
+  mount that does not unmount cleanly can leave the volume inconsistent.
 - Growth synchronizes duplicated local and parent-index `$FILE_NAME` sizes,
   but those metadata writes are not crash-atomic until LFS transactions exist.
 - Native NTFS/LZNT1-compressed and encrypted stream writes remain unsupported

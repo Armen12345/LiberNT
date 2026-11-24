@@ -57,7 +57,9 @@ list(APPEND SOURCE
     DiskSignatureCollision.c
     EmulatedProcess.c
     DispatcherStress.c
+    ProcessorAffinity.c
     ProcessorGroups.c
+    CreateSymbolicLink.c
     dosdev.c
     ExportStubs.c
     DirectoryEntryUpdates.c
@@ -130,6 +132,7 @@ list(APPEND SOURCE
     TebSegmentAfterWait.c
     SharedMemorySecurity.c
     SharedMemoryTransfer.c
+    MapFlush.c
     StarvationBoost.c
     SystemTimeChangeTimers.c
     TzSpecificLocalTimeEx.c

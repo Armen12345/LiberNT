@@ -20,6 +20,7 @@ set(MM_CORE
     ${NVS_ROOT}/pagefile/pagefile.c
     ${NVS_ROOT}/fault/fault.c
     ${NVS_ROOT}/vm/vmops.c
+    ${NVS_ROOT}/vm/cfg.c
     ${NVS_ROOT}/vm/execwrite.c
     ${NVS_ROOT}/vm/writewatch.c
     ${NVS_ROOT}/vm/large.c
@@ -74,6 +75,9 @@ nvs_assert_standalone(${MM_CORE} ${CC_ENGINE})
 function(mm_test_variant NAME ARCH MACHINE)
     add_executable(${NAME} ${MM_TESTS} ${MM_CORE}
         ${NVS_ROOT}/arch/${ARCH}/pte.c ${NVS_ROOT}/arch/${ARCH}/descriptor.c)
+    if(EXISTS ${NVS_ROOT}/arch/${ARCH}/root.c)
+        target_sources(${NAME} PRIVATE ${NVS_ROOT}/arch/${ARCH}/root.c)
+    endif()
     target_compile_definitions(${NAME} PRIVATE MM_HOST_TEST MM_HOST_ALLOC_TEST CC_HOST_TEST ${MACHINE} ${ARGN})
     target_include_directories(${NAME} PRIVATE ${NVS_ROOT}/.. ${NVS_ROOT}/arch/${ARCH})
     target_compile_options(${NAME} PRIVATE -Wall -Wextra -Wno-unused-parameter -Wno-multichar -g)

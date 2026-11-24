@@ -36,6 +36,7 @@ extern void func_OpenTrace(void);
 extern void func_PrivilegeNames(void);
 extern void func_QueryServiceConfig(void);
 extern void func_QueryServiceConfig2(void);
+extern void func_RegCreateKeyBackupRestore(void);
 extern void func_RegCreateKeyEx(void);
 extern void func_RegCreateKeyTransacted(void);
 extern void func_RegEnumKey(void);
@@ -50,6 +51,7 @@ extern void func_RegOpenKeyExW(void);
 extern void func_RegOpenKeyTransacted(void);
 extern void func_RegQueryInfoKey(void);
 extern void func_RegQueryValueExW(void);
+extern void func_RestrictedTokenUser(void);
 extern void func_RtlEncryptMemory(void);
 extern void func_SaferIdentifyLevel(void);
 extern void func_SaferLevels(void);
@@ -106,6 +108,7 @@ const struct test winetest_testlist[] =
     { "PrivilegeNames", func_PrivilegeNames },
     { "QueryServiceConfig", func_QueryServiceConfig },
     { "QueryServiceConfig2", func_QueryServiceConfig2 },
+    { "RegCreateKeyBackupRestore", func_RegCreateKeyBackupRestore },
     { "RegCreateKeyEx", func_RegCreateKeyEx },
     { "RegCreateKeyTransacted", func_RegCreateKeyTransacted },
     { "RegEnumKey", func_RegEnumKey },
@@ -120,6 +123,7 @@ const struct test winetest_testlist[] =
     { "RegOpenKeyExW", func_RegOpenKeyExW },
     { "RegOpenKeyTransacted", func_RegOpenKeyTransacted },
     { "RegQueryValueExW", func_RegQueryValueExW },
+    { "RestrictedTokenUser", func_RestrictedTokenUser },
     { "RtlEncryptMemory", func_RtlEncryptMemory },
     { "SaferIdentifyLevel", func_SaferIdentifyLevel },
     { "SaferLevels", func_SaferLevels },

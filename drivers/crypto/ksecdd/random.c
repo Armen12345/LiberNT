@@ -9,7 +9,7 @@
 
 #include "ksecdd.h"
 #if defined(_M_ARM64) || defined(__aarch64__)
-#include <reactos/arm64/sysreg.h>
+#include <libernt/arm64/sysreg.h>
 #endif
 
 #define NDEBUG
@@ -241,8 +241,7 @@ KsecReadMachineSpecificCounters(
     }
 #endif
 #elif defined(_M_ARM)
-    /* Read the Cycle Counter Register */
-    MachineSpecificCounters->Ccr = _MoveFromCoprocessor(CP15_PMCCNTR);
+    *MachineSpecificCounters = (ULONG)ReadTimeStampCounter();
 #elif defined(_M_ARM64) || defined(__aarch64__)
     {
         ULONG64 cntvct;

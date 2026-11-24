@@ -19,11 +19,11 @@ PVOID MmUnloadedDrivers;
 PVOID MmLastUnloadedDrivers;
 
 static
-PLDR_DATA_TABLE_ENTRY
+PKLDR_DATA_TABLE_ENTRY
 MiModuleFromLink(
     _In_ PLIST_ENTRY Link)
 {
-    return CONTAINING_RECORD(Link, LDR_DATA_TABLE_ENTRY, InLoadOrderLinks);
+    return CONTAINING_RECORD(Link, KLDR_DATA_TABLE_ENTRY, InLoadOrderLinks);
 }
 
 #if DBG
@@ -54,12 +54,12 @@ MiUnlockSystemImages(VOID)
     KeLeaveCriticalRegion();
 }
 
-PLDR_DATA_TABLE_ENTRY
+PKLDR_DATA_TABLE_ENTRY
 MiFindSystemImage(
     _In_ PCUNICODE_STRING Name,
     _In_ BOOLEAN MatchFullName)
 {
-    PLDR_DATA_TABLE_ENTRY Entry;
+    PKLDR_DATA_TABLE_ENTRY Entry;
     PLIST_ENTRY Link;
 
     ASSERT(MiOwnsSystemImages());
@@ -77,7 +77,7 @@ MiFindSystemImage(
 static
 VOID
 MiEditModuleList(
-    _In_ PLDR_DATA_TABLE_ENTRY Entry,
+    _In_ PKLDR_DATA_TABLE_ENTRY Entry,
     _In_ BOOLEAN Publish)
 {
     KIRQL OldIrql;
@@ -105,7 +105,7 @@ MiEditModuleList(
 
 VOID
 MiPublishSystemImage(
-    _In_ PLDR_DATA_TABLE_ENTRY Entry)
+    _In_ PKLDR_DATA_TABLE_ENTRY Entry)
 {
     ASSERT(Entry->InLoadOrderLinks.Flink == NULL);
     MiEditModuleList(Entry, TRUE);
@@ -113,18 +113,18 @@ MiPublishSystemImage(
 
 VOID
 MiWithdrawSystemImage(
-    _In_ PLDR_DATA_TABLE_ENTRY Entry)
+    _In_ PKLDR_DATA_TABLE_ENTRY Entry)
 {
     ASSERT(Entry->InLoadOrderLinks.Flink != NULL);
     MiEditModuleList(Entry, FALSE);
 }
 
-PLDR_DATA_TABLE_ENTRY
+PKLDR_DATA_TABLE_ENTRY
 NTAPI
 MiLookupDataTableEntry(
     _In_ PVOID Address)
 {
-    PLDR_DATA_TABLE_ENTRY Entry;
+    PKLDR_DATA_TABLE_ENTRY Entry;
     PLIST_ENTRY Link;
 
     for (Link = PsLoadedModuleList.Flink; Link != &PsLoadedModuleList; Link = Link->Flink)
@@ -161,7 +161,7 @@ MiImportListCount(
     return (ULONG)((PLOAD_IMPORTS)ImportList)->Count;
 }
 
-PLDR_DATA_TABLE_ENTRY
+PKLDR_DATA_TABLE_ENTRY
 MiImportListEntry(
     _In_ PVOID ImportList,
     _In_ ULONG Index)
@@ -169,7 +169,7 @@ MiImportListEntry(
     ASSERT(Index < MiImportListCount(ImportList));
 
     if ((ULONG_PTR)ImportList & MM_SYSLDR_SINGLE_ENTRY)
-        return (PLDR_DATA_TABLE_ENTRY)((ULONG_PTR)ImportList & ~(ULONG_PTR)MM_SYSLDR_SINGLE_ENTRY);
+        return (PKLDR_DATA_TABLE_ENTRY)((ULONG_PTR)ImportList & ~(ULONG_PTR)MM_SYSLDR_SINGLE_ENTRY);
 
     return ((PLOAD_IMPORTS)ImportList)->Entry[Index];
 }
@@ -184,7 +184,7 @@ MiFreeImportList(
 
 PVOID
 MiCreateImportList(
-    _In_reads_(Count) PLDR_DATA_TABLE_ENTRY *Modules,
+    _In_reads_(Count) PKLDR_DATA_TABLE_ENTRY *Modules,
     _In_ ULONG Count)
 {
     PLOAD_IMPORTS Table;
@@ -220,7 +220,7 @@ MmIsSystemImageImportingModule(
     _In_ PVOID ImageBase,
     _In_ PCUNICODE_STRING ModuleName)
 {
-    PLDR_DATA_TABLE_ENTRY Entry;
+    PKLDR_DATA_TABLE_ENTRY Entry;
     BOOLEAN Found = FALSE;
     ULONG Index, Count;
 
@@ -248,11 +248,11 @@ MmIsSystemImageImportingModule(
 
 CODE_SEG("INIT")
 static
-PLDR_DATA_TABLE_ENTRY
+PKLDR_DATA_TABLE_ENTRY
 MiCopyBootImageEntry(
-    _In_ PLDR_DATA_TABLE_ENTRY Source)
+    _In_ PKLDR_DATA_TABLE_ENTRY Source)
 {
-    PLDR_DATA_TABLE_ENTRY Copy;
+    PKLDR_DATA_TABLE_ENTRY Copy;
     USHORT BaseBytes = Source->BaseDllName.Length;
     USHORT FullBytes = Source->FullDllName.Length;
 
@@ -263,8 +263,6 @@ MiCopyBootImageEntry(
     *Copy = *Source;
     Copy->InLoadOrderLinks.Flink = NULL;
     Copy->InLoadOrderLinks.Blink = NULL;
-    InitializeListHead(&Copy->InMemoryOrderLinks);
-    InitializeListHead(&Copy->InInitializationOrderLinks);
 
     Copy->BaseDllName.Buffer = (PWCH)(Copy + 1);
     Copy->BaseDllName.Length = BaseBytes;
@@ -292,8 +290,8 @@ static
 VOID
 MiReplaceBootDriverEntry(
     _In_ PLOADER_PARAMETER_BLOCK LoaderBlock,
-    _In_ PLDR_DATA_TABLE_ENTRY LoaderEntry,
-    _In_ PLDR_DATA_TABLE_ENTRY Entry)
+    _In_ PKLDR_DATA_TABLE_ENTRY LoaderEntry,
+    _In_ PKLDR_DATA_TABLE_ENTRY Entry)
 {
     PBOOT_DRIVER_LIST_ENTRY BootEntry;
     PLIST_ENTRY Link;
@@ -312,12 +310,12 @@ CODE_SEG("INIT")
 static
 ULONG
 MiCollectBootBindings(
-    _In_ PLDR_DATA_TABLE_ENTRY Importer,
-    _Out_writes_(Capacity) PLDR_DATA_TABLE_ENTRY *Targets,
+    _In_ PKLDR_DATA_TABLE_ENTRY Importer,
+    _Out_writes_(Capacity) PKLDR_DATA_TABLE_ENTRY *Targets,
     _In_ ULONG Capacity)
 {
     PIMAGE_IMPORT_DESCRIPTOR Descriptor;
-    PLDR_DATA_TABLE_ENTRY Current = NULL;
+    PKLDR_DATA_TABLE_ENTRY Current = NULL;
     PULONG_PTR Slot;
     ULONG Size, Found = 0, Index;
 
@@ -355,11 +353,11 @@ CODE_SEG("INIT")
 static
 BOOLEAN
 MiLinkBootImageImports(
-    _In_ PLDR_DATA_TABLE_ENTRY Kernel,
-    _In_ PLDR_DATA_TABLE_ENTRY Hal,
+    _In_ PKLDR_DATA_TABLE_ENTRY Kernel,
+    _In_ PKLDR_DATA_TABLE_ENTRY Hal,
     _In_ ULONG ModuleCount)
 {
-    PLDR_DATA_TABLE_ENTRY *Targets, Importer;
+    PKLDR_DATA_TABLE_ENTRY *Targets, Importer;
     PLIST_ENTRY Link;
     ULONG Found, Index, Kept;
     PVOID List;
@@ -407,7 +405,7 @@ MiInitializeLoadedModuleList(
 {
     UNICODE_STRING KernelName = RTL_CONSTANT_STRING(L"ntoskrnl.exe");
     UNICODE_STRING HalName = RTL_CONSTANT_STRING(L"hal.dll");
-    PLDR_DATA_TABLE_ENTRY Source, Copy, Kernel = NULL, Hal = NULL;
+    PKLDR_DATA_TABLE_ENTRY Source, Copy, Kernel = NULL, Hal = NULL;
     PLIST_ENTRY Link;
     ULONG Count = 0;
 
@@ -454,4 +452,160 @@ MiInitializeLoadedModuleList(
     }
 
     return MiLinkBootImageImports(Kernel, Hal, Count);
+}
+
+typedef struct _MI_BOOT_DLL_FRAME
+{
+    PKLDR_DATA_TABLE_ENTRY Module;
+    ULONG Next;
+} MI_BOOT_DLL_FRAME, *PMI_BOOT_DLL_FRAME;
+
+typedef struct _MI_BOOT_DLL_WALK
+{
+    PKLDR_DATA_TABLE_ENTRY *Seen;
+    PMI_BOOT_DLL_FRAME Stack;
+    ULONG Count;
+    ULONG Capacity;
+} MI_BOOT_DLL_WALK, *PMI_BOOT_DLL_WALK;
+
+CODE_SEG("INIT")
+static
+BOOLEAN
+MiBootDllSeen(
+    _In_ PMI_BOOT_DLL_WALK Walk,
+    _In_ PKLDR_DATA_TABLE_ENTRY Module)
+{
+    ULONG Index;
+
+    for (Index = 0; Index < Walk->Count; Index++)
+    {
+        if (Walk->Seen[Index] == Module)
+            return TRUE;
+    }
+
+    return FALSE;
+}
+
+CODE_SEG("INIT")
+static
+VOID
+MiInitializeBootDll(
+    _Inout_ PMI_BOOT_DLL_WALK Walk,
+    _In_ PKLDR_DATA_TABLE_ENTRY Root)
+{
+    PKLDR_DATA_TABLE_ENTRY Module;
+    PMI_BOOT_DLL_FRAME Frame;
+    ULONG Depth = 0;
+    NTSTATUS Status;
+
+    ASSERT(Walk->Count <= Walk->Capacity);
+
+    if (MiBootDllSeen(Walk, Root))
+        return;
+
+    ASSERT(Walk->Count < Walk->Capacity);
+    if (Walk->Count == Walk->Capacity)
+        return;
+
+    Walk->Seen[Walk->Count++] = Root;
+    Walk->Stack[Depth].Module = Root;
+    Walk->Stack[Depth].Next = 0;
+    Depth++;
+
+    while (Depth != 0)
+    {
+        Frame = &Walk->Stack[Depth - 1];
+        ASSERT(Frame->Module->LoadedImports != MM_SYSLDR_BOOT_LOADED);
+
+        if (Frame->Next < MiImportListCount(Frame->Module->LoadedImports))
+        {
+            Module = MiImportListEntry(Frame->Module->LoadedImports, Frame->Next++);
+            ASSERT(Module != NULL);
+            if (MiBootDllSeen(Walk, Module))
+                continue;
+
+            ASSERT(Walk->Count < Walk->Capacity);
+            ASSERT(Depth < Walk->Capacity);
+            if (Walk->Count == Walk->Capacity || Depth == Walk->Capacity)
+                return;
+
+            Walk->Seen[Walk->Count++] = Module;
+            Walk->Stack[Depth].Module = Module;
+            Walk->Stack[Depth].Next = 0;
+            Depth++;
+            continue;
+        }
+
+        Module = Frame->Module;
+        Depth--;
+
+        Status = MmCallDllInitialize(Module, &PsLoadedModuleList);
+        if (!NT_SUCCESS(Status))
+        {
+            /* FIXME: a boot DLL whose DllInitialize fails stays loaded and the drivers that import it still start */
+            DPRINT1("DllInitialize of the boot DLL %wZ failed with 0x%lx\n", &Module->BaseDllName, Status);
+        }
+    }
+}
+
+CODE_SEG("INIT")
+NTSTATUS
+NTAPI
+MmCallBootDllInitialize(
+    _In_ PLIST_ENTRY BootDriverListHead)
+{
+    PBOOT_DRIVER_LIST_ENTRY BootEntry;
+    PIMAGE_NT_HEADERS NtHeaders;
+    PKLDR_DATA_TABLE_ENTRY Module;
+    MI_BOOT_DLL_WALK Walk;
+    PLIST_ENTRY Link;
+    ULONG Index;
+
+    PAGED_CODE();
+
+    RtlZeroMemory(&Walk, sizeof(Walk));
+
+    KeEnterCriticalRegion();
+    ExAcquireResourceSharedLite(&PsLoadedModuleResource, TRUE);
+    for (Link = PsLoadedModuleList.Flink; Link != &PsLoadedModuleList; Link = Link->Flink)
+        Walk.Capacity++;
+    ExReleaseResourceLite(&PsLoadedModuleResource);
+    KeLeaveCriticalRegion();
+
+    ASSERT(Walk.Capacity != 0);
+
+    Walk.Seen = ExAllocatePoolWithTag(PagedPool, Walk.Capacity * sizeof(*Walk.Seen), TAG_LDR_IMPORTS);
+    Walk.Stack = ExAllocatePoolWithTag(PagedPool, Walk.Capacity * sizeof(*Walk.Stack), TAG_LDR_IMPORTS);
+    if (Walk.Seen == NULL || Walk.Stack == NULL)
+    {
+        if (Walk.Seen != NULL)
+            ExFreePoolWithTag(Walk.Seen, TAG_LDR_IMPORTS);
+        if (Walk.Stack != NULL)
+            ExFreePoolWithTag(Walk.Stack, TAG_LDR_IMPORTS);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    for (Link = BootDriverListHead->Flink; Link != BootDriverListHead; Link = Link->Flink)
+    {
+        BootEntry = CONTAINING_RECORD(Link, BOOT_DRIVER_LIST_ENTRY, Link);
+        Module = BootEntry->LdrEntry;
+        if (Module == NULL)
+            continue;
+
+        NtHeaders = RtlImageNtHeader(Module->DllBase);
+        if (NtHeaders == NULL || NtHeaders->OptionalHeader.AddressOfEntryPoint == 0)
+        {
+            MiInitializeBootDll(&Walk, Module);
+            continue;
+        }
+
+        for (Index = 0; Index < MiImportListCount(Module->LoadedImports); Index++)
+            MiInitializeBootDll(&Walk, MiImportListEntry(Module->LoadedImports, Index));
+    }
+
+    ASSERT(Walk.Count <= Walk.Capacity);
+
+    ExFreePoolWithTag(Walk.Stack, TAG_LDR_IMPORTS);
+    ExFreePoolWithTag(Walk.Seen, TAG_LDR_IMPORTS);
+    return STATUS_SUCCESS;
 }

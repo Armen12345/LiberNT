@@ -5,7 +5,6 @@
  * COPYRIGHT:   Copyright 2026 Ahmed ARIF <arif.ing@outlook.com>
  */
 
-#include <blefi.h>
 #include "../../winload/winload.h"
 
 #define AMD64_LOADER_PAGES   0x100000
@@ -67,7 +66,7 @@ Amd64LoadDescriptorTables(
     _In_ PVOID Gdtr,
     _In_ PVOID Idtr);
 
-const PFN_NUMBER MmArchMaxLoaderPage = AMD64_LOADER_PAGES;
+PFN_NUMBER MmArchMaxLoaderPage = AMD64_LOADER_PAGES;
 const PFN_NUMBER MmArchMaxRamdiskPage = AMD64_RAMDISK_PAGES;
 const PCSTR OslArchSystemIdentifier = "AT/AT COMPATIBLE";
 
@@ -356,12 +355,6 @@ OslArchReserveFirmwareMemory(
     _In_ PLOADER_PARAMETER_BLOCK LoaderBlock)
 {
     UNREFERENCED_PARAMETER(LoaderBlock);
-}
-
-VOID
-FwExitBootServices(VOID)
-{
-    UefiLeaveBootServices();
 }
 
 static

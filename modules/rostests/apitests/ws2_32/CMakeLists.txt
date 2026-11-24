@@ -31,12 +31,16 @@ list(APPEND SOURCE
     recv.c
     send.c
     sendto_neighbor.c
+    tcp_connected_options.c
+    tcp_keepalive.c
+    tcp_nodelay.c
     udp_connreset.c
     udp_queue.c
     udp_quic.c
     WSAAsync.c
     WSAIoctl.c
     WSARecv.c
+    WSASendMsg.c
     WSAStartup.c)
 
 list(APPEND PCH_SKIP_SOURCE

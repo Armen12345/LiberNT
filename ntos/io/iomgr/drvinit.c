@@ -424,7 +424,7 @@ IopBuildDriverRegistryPath(
 
 NTSTATUS
 IopInitializeDriverModule(
-    _In_ PLDR_DATA_TABLE_ENTRY ModuleObject,
+    _In_ PKLDR_DATA_TABLE_ENTRY ModuleObject,
     _In_ HANDLE ServiceHandle,
     _Out_ PDRIVER_OBJECT *DriverObject,
     _Out_ NTSTATUS *DriverEntryStatus,
@@ -584,6 +584,7 @@ IopInitializeDriverModule(
     {
         if (HoldPnpUnloadBarrier) IopReleasePnpUnloadBarrier(Created);
 
+        IopRemoveDriverReinitialization(Created);
         Created->DriverSection = NULL;
         ObMakeTemporaryObject(Created);
         ObDereferenceObject(Created);
@@ -606,7 +607,7 @@ IopLoadServiceModule(
     _Out_ PDRIVER_OBJECT *DriverObject)
 {
     PKEY_VALUE_FULL_INFORMATION Information = NULL;
-    PLDR_DATA_TABLE_ENTRY ModuleObject = NULL;
+    PKLDR_DATA_TABLE_ENTRY ModuleObject = NULL;
     UNICODE_STRING ServiceName;
     UNICODE_STRING ImagePath;
     UNICODE_STRING DriverName;
@@ -724,9 +725,9 @@ IopLoadServiceModule(
 
 NTSTATUS
 LdrProcessDriverModule(
-    _In_ PLDR_DATA_TABLE_ENTRY LdrEntry,
+    _In_ PKLDR_DATA_TABLE_ENTRY LdrEntry,
     _In_ PUNICODE_STRING FileName,
-    _Out_ PLDR_DATA_TABLE_ENTRY *ModuleObject)
+    _Out_ PKLDR_DATA_TABLE_ENTRY *ModuleObject)
 {
     PVOID ImageBase = NULL;
     NTSTATUS Status;
@@ -772,7 +773,9 @@ FASTCALL
 IopInitializeBootDrivers(VOID)
 {
     PBOOT_DRIVER_LIST_ENTRY BootEntry;
+    PIMAGE_NT_HEADERS NtHeaders;
     PDRIVER_OBJECT DriverObject;
+    BOOLEAN BootDllsInitialized;
     NTSTATUS EntryStatus;
     PLIST_ENTRY ListEntry;
     NTSTATUS Status;
@@ -786,6 +789,13 @@ IopInitializeBootDrivers(VOID)
     if (!NT_SUCCESS(Status))
     {
         DPRINT1("I/O: the service group order is unavailable (%lx)\n", Status);
+    }
+
+    Status = MmCallBootDllInitialize(&IopLoaderBlock->BootDriverListHead);
+    BootDllsInitialized = NT_SUCCESS(Status);
+    if (!BootDllsInitialized)
+    {
+        DPRINT1("I/O: the boot DLLs could not be initialized (%lx)\n", Status);
     }
 
     ListEntry = IopLoaderBlock->BootDriverListHead.Flink;
@@ -805,6 +815,15 @@ IopInitializeBootDrivers(VOID)
                          0,
                          0,
                          0);
+        }
+
+        NtHeaders = RtlImageNtHeader(BootEntry->LdrEntry->DllBase);
+        if (BootDllsInitialized &&
+            (NtHeaders == NULL ||
+             NtHeaders->OptionalHeader.AddressOfEntryPoint == 0))
+        {
+            IopBootLog(&BootEntry->FilePath, TRUE);
+            continue;
         }
 
         Status = IopOpenServiceKeyForPath(&BootEntry->RegistryPath,

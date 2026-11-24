@@ -15,7 +15,7 @@ add_definitions(
 
 include_directories(
     BEFORE include
-    ${REACTOS_SOURCE_DIR}/sdk/include/reactos/subsys
+    ${REACTOS_SOURCE_DIR}/sdk/include/libernt/subsys
     ${REACTOS_SOURCE_DIR}/sdk/lib/3rdparty/symcrypt/inc)
 
 add_library(rtl_um OBJECT
@@ -45,6 +45,7 @@ list(APPEND SOURCE
     ldr/ldrnotify.c
     ldr/ldrmui.c
     ldr/ldrpe.c
+    ldr/ldrddag.c
     ldr/ldrutils.c
     ldr/verifier.c
     rtl/barrier.c
@@ -73,7 +74,7 @@ elseif(ARCH STREQUAL "amd64")
         dispatch/amd64/dispatch.S
         compat/amd64/msys2.S)
 elseif(ARCH STREQUAL "arm")
-    list(APPEND ASM_SOURCE dispatch/arm/stubs_asm.s)
+    list(APPEND ASM_SOURCE dispatch/arm/dispatch.S)
 elseif(ARCH STREQUAL "arm64")
     list(APPEND ASM_SOURCE
         dispatch/arm64/dispatch.S
@@ -93,6 +94,12 @@ elseif(ARCH STREQUAL "ppc")
     list(APPEND SOURCE
         dispatch/dispatch.c
         rtl/ppc/rtlexcpt.c)
+endif()
+
+if(ARCH STREQUAL "amd64")
+    list(APPEND SOURCE ldr/amd64/scp.c)
+else()
+    list(APPEND SOURCE ldr/noscp.c)
 endif()
 
 if(ARCH STREQUAL "riscv64")

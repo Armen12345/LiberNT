@@ -56,8 +56,16 @@ static const struct context_copy_range RtlpCopyRangesI386[] =
 #ifdef __REACTOS__
 static const struct context_copy_range RtlpCopyRangesArm64[] =
 {
-    {0x4, 0x1}, {0x8, 0x2}, {0x98, 0x10}, {0xa0, 0x2}, {0xf0, 0x1}, {0x110, 0x4},
-    {0x318, 0x8}, {0x390, 0}
+    {0x4, 0x1}, {0x8, 0x2}, {0x98, 0x10}, {0xa0, 0x2}, {0xf0, 0x1},
+    /* FP low covers V0-V15 and FPCR/FPSR. FP high covers V16-V31. */
+    {0x110, 0x4 | 0x40}, {0x210, 0x4 | 0x80}, {0x310, 0x4 | 0x40}, {0x318, 0x8}, {0x390, 0}
+};
+
+/* ARM CONTEXT (winnt.h): R0-R12, Sp/Lr/Pc/Cpsr, Fpscr and D0-D31, debug registers; 0x1a0 bytes. */
+#define RTLP_CONTEXT_ARM 0x00200000
+static const struct context_copy_range RtlpCopyRangesArm[] =
+{
+    {0x4, 0x2}, {0x38, 0x1}, {0x48, 0x4}, {0x150, 0x8}, {0x198, 0}, {0x1a0, 0}
 };
 #endif
 
@@ -65,6 +73,7 @@ static const struct context_parameters
 {
     ULONG arch_flag;
     ULONG supported_flags;
+    ULONG xstate_flag;
     ULONG context_size;
     ULONG legacy_size;
     ULONG context_ex_size;
@@ -77,6 +86,7 @@ static const struct context_parameters
     {
         CONTEXT_AMD64,
         0xd8000000 | CONTEXT_AMD64_ALL | CONTEXT_AMD64_XSTATE,
+        CONTEXT_AMD64_XSTATE & ~CONTEXT_AMD64,
         sizeof(AMD64_CONTEXT),
         sizeof(AMD64_CONTEXT),
         0x20,
@@ -88,6 +98,7 @@ static const struct context_parameters
     {
         CONTEXT_i386,
         0xd8000000 | CONTEXT_I386_ALL | CONTEXT_I386_XSTATE,
+        CONTEXT_I386_XSTATE & ~CONTEXT_i386,
         sizeof(I386_CONTEXT),
         FIELD_OFFSET(I386_CONTEXT, ExtendedRegisters),
         0x18,
@@ -100,6 +111,7 @@ static const struct context_parameters
     {
         CONTEXT_ARM64,
         0xf8000000 | CONTEXT_ARM64_ALL | CONTEXT_ARM64_XSTATE,
+        CONTEXT_ARM64_XSTATE & ~CONTEXT_ARM64,
         sizeof(ARM64_NT_CONTEXT),
         sizeof(ARM64_NT_CONTEXT),
         0x20,
@@ -107,6 +119,18 @@ static const struct context_parameters
         TYPE_ALIGNMENT(ARM64_NT_CONTEXT) - 1,
         FIELD_OFFSET(ARM64_NT_CONTEXT, ContextFlags),
         RtlpCopyRangesArm64
+    },
+    {
+        RTLP_CONTEXT_ARM,
+        0xf8000000 | RTLP_CONTEXT_ARM | 0xf,
+        0,
+        0x1a0,
+        0x1a0,
+        0x18,
+        7,
+        7,
+        0,
+        RtlpCopyRangesArm
     }
 #endif
 };
@@ -207,13 +231,13 @@ RtlGetExtendedContextLength2(ULONG ContextFlags, PULONG Length, ULONG64 Compacti
         return STATUS_NOT_SUPPORTED;
 #endif
 
-    if (!(ContextFlags & 0x40))
+    if (!(ContextFlags & Parameters->xstate_flag))
     {
         *Length = Parameters->context_size + Parameters->context_ex_size + Parameters->alignment;
         return STATUS_SUCCESS;
     }
 
-    SupportedMask = RtlGetEnabledExtendedFeatures(~(ULONG64)0);
+    SupportedMask = SharedUserData->XState.EnabledFeatures;
     if (!SupportedMask)
         return STATUS_NOT_SUPPORTED;
 
@@ -256,8 +280,8 @@ RtlInitializeExtendedContext2(PVOID Context,
         return STATUS_NOT_SUPPORTED;
 #endif
 
-    if ((ContextFlags & 0x40) &&
-        !(SupportedMask = RtlGetEnabledExtendedFeatures(~(ULONG64)0)))
+    if ((ContextFlags & Parameters->xstate_flag) &&
+        !(SupportedMask = SharedUserData->XState.EnabledFeatures))
         return STATUS_NOT_SUPPORTED;
 
     Context = (PVOID)(((ULONG_PTR)Context + Parameters->true_alignment) &
@@ -268,7 +292,7 @@ RtlInitializeExtendedContext2(PVOID Context,
     Extended->Legacy.Offset = Extended->All.Offset = -(LONG)Parameters->context_size;
     Extended->Legacy.Length = ContextFlags & 0x20 ? Parameters->context_size : Parameters->legacy_size;
 
-    if (ContextFlags & 0x40)
+    if (ContextFlags & Parameters->xstate_flag)
     {
         XSTATE *XState;
 
@@ -331,7 +355,12 @@ RtlSetExtendedFeaturesMask(RTL_CONTEXT_EX *ContextEx, ULONG64 FeatureMask)
 {
     XSTATE *XState = (XSTATE *)((PUCHAR)ContextEx + ContextEx->XState.Offset);
 
-    XState->Mask = RtlGetEnabledExtendedFeatures(FeatureMask) & ~(ULONG64)3;
+    ULONG64 Enabled = SharedUserData->XState.EnabledFeatures;
+#if defined(_ARM64_) && !defined(_M_ARM64EC)
+    if (ContextEx->Legacy.Length == sizeof(ARM64_NT_CONTEXT))
+        Enabled = SharedUserData->XStateArm64.EnabledFeatures;
+#endif
+    XState->Mask = FeatureMask & Enabled & ~(ULONG64)3;
 }
 
 ULONG64
@@ -387,12 +416,12 @@ RtlCopyExtendedContext(RTL_CONTEXT_EX *Destination,
         return STATUS_NOT_SUPPORTED;
 #endif
 
-    FeatureMask = RtlGetEnabledExtendedFeatures(~(ULONG64)0);
-    if (!FeatureMask && (ContextFlags & 0x40))
+    FeatureMask = SharedUserData->XState.EnabledFeatures;
+    if (!FeatureMask && (ContextFlags & Parameters->xstate_flag))
         return STATUS_NOT_SUPPORTED;
 
     RtlpCopyContextRanges(RtlLocateLegacyContext(Destination, NULL), ContextFlags, RtlLocateLegacyContext(Source, NULL), Parameters);
-    if (!(ContextFlags & 0x40))
+    if (!(ContextFlags & Parameters->xstate_flag))
         return STATUS_SUCCESS;
     if (Destination->XState.Length < sizeof(XSAVE_AREA_HEADER))
         return STATUS_BUFFER_OVERFLOW;
@@ -445,8 +474,10 @@ RtlCopyContext(PCONTEXT Destination,
     ULONG ArchFlag, ContextSize, FlagsOffset, DestinationFlags, SourceFlags;
 
 #ifdef __REACTOS__
-    if (ContextFlags & CONTEXT_ARM64)
+    if (ContextFlags & (CONTEXT_ARM64 | RTLP_CONTEXT_ARM))
     {
+        const ULONG ArmMask = ArchMask | CONTEXT_ARM64 | RTLP_CONTEXT_ARM;
+
         Parameters = RtlpGetContextParameters(ContextFlags);
         if (!Parameters)
             return STATUS_INVALID_PARAMETER;
@@ -455,8 +486,8 @@ RtlCopyContext(PCONTEXT Destination,
 
         DestinationFlags = *(PULONG)(DestinationBytes + Parameters->flags_offset);
         SourceFlags = *(PULONG)(SourceBytes + Parameters->flags_offset);
-        if ((DestinationFlags & (ArchMask | CONTEXT_ARM64)) != CONTEXT_ARM64 ||
-            (SourceFlags & (ArchMask | CONTEXT_ARM64)) != CONTEXT_ARM64)
+        if ((DestinationFlags & ArmMask) != Parameters->arch_flag ||
+            (SourceFlags & ArmMask) != Parameters->arch_flag)
             return STATUS_INVALID_PARAMETER;
 
         ContextFlags &= SourceFlags & ~(CONTEXT_EXCEPTION_ACTIVE | CONTEXT_SERVICE_ACTIVE | CONTEXT_EXCEPTION_REPORTING);
@@ -465,7 +496,7 @@ RtlCopyContext(PCONTEXT Destination,
     }
 #endif
 
-    if ((ContextFlags & 0x40) && !RtlGetEnabledExtendedFeatures(~(ULONG64)0))
+    if ((ContextFlags & 0x40) && !SharedUserData->XState.EnabledFeatures)
         return STATUS_NOT_SUPPORTED;
 
     ArchFlag = ContextFlags & ArchMask;

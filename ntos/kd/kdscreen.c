@@ -25,6 +25,8 @@ static BOOLEAN KdpScreenInitialised = FALSE;
 
 static BOOLEAN KdpScreenJoinedForStop = FALSE;
 
+static BOOLEAN KdpScreenJoinedEarly = FALSE;
+
 /* Between KdpScreenEnterStop() and KdpScreenRelease(): what is printed is drawn at once */
 static BOOLEAN KdpScreenStopped = FALSE;
 
@@ -51,6 +53,13 @@ static LARGE_INTEGER KdpScreenHeldSince;
 
 #define KDP_SCREEN_HOLD_MS 50
 
+#define KDP_SCREEN_ROW_SIZE 1024
+
+/* The row being drawn, after a leading '\r' that sends the boot video driver back to its start */
+static CHAR KdpScreenRow[KDP_SCREEN_ROW_SIZE + 2] = "\r";
+static ULONG KdpScreenRowLength;
+static ULONG KdpScreenColumns;
+
 /* PRIVATE FUNCTIONS **********************************************************/
 
 static
@@ -75,6 +84,10 @@ KdpScreenAddStop(
 
 static CHAR KdpScreenReplay[KDP_SCREEN_REPLAY_SIZE];
 
+#define KDP_SCREEN_BOOT_TEXT_SIZE 16384
+
+static CHAR KdpScreenBootText[KDP_SCREEN_BOOT_TEXT_SIZE + 1];
+
 static
 VOID
 KdpScreenSetConsole(
@@ -84,6 +97,7 @@ KdpScreenSetConsole(
     ULONG Width = SCREEN_WIDTH;
     ULONG Height = SCREEN_HEIGHT;
     ULONG Right = SCREEN_WIDTH - 1;
+    ULONG Columns = 0;
 
     InbvUseCompactFont();
 
@@ -95,7 +109,11 @@ KdpScreenSetConsole(
         Width = DisplayInfo.Width;
         Height = DisplayInfo.Height;
         Right = Width - (Width % DisplayInfo.CharacterWidth) - 1;
+        Columns = (Right + 1) / DisplayInfo.CharacterWidth;
     }
+
+    /* FIXME: rows wider than KDP_SCREEN_ROW_SIZE or of unknown width are not tracked, so a backspace erases nothing there */
+    KdpScreenColumns = (Columns <= KDP_SCREEN_ROW_SIZE) ? Columns : 0;
 
     if (Clear)
     {
@@ -103,6 +121,9 @@ KdpScreenSetConsole(
         InbvSolidColorFill(0, 0, Width - 1, Height - 1, BV_COLOR_BLACK);
         InbvSetScrollRegion(0, 0, Right, Height - 1);
     }
+
+    if (Clear || (KdpScreenRowLength >= KdpScreenColumns))
+        KdpScreenRowLength = 0;
 
     InbvSetTextColor(BV_COLOR_WHITE);
     InbvInstallDisplayStringFilter(NULL);
@@ -119,12 +140,14 @@ KdpScreenJoin(VOID)
         return;
 
     Table->KdpPrintRoutine = KdpScreenPrint;
-    InsertTailList(&KdProviders, &Table->KdProvidersList);
+    if (!KdpScreenJoinedEarly)
+        InsertTailList(&KdProviders, &Table->KdProvidersList);
     KdpScreenInitialised = TRUE;
 }
 
 static
 VOID
+NTAPI
 KdpScreenPrintCallback(
     _In_ PSTRING Output,
     _In_ ULONG ComponentId,
@@ -181,6 +204,32 @@ KdpScreenReplayTail(VOID)
         KdpScreenAddStop(KdpScreenReplay + Start, Length - Start);
 }
 
+/* The console that takes over from the early screen continues the log instead of starting blank */
+static
+VOID
+KdpScreenReplayBoot(VOID)
+{
+    ULONG Length, Start = 0;
+
+    Length = KdpCopyPrintBufferTail(KdpScreenBootText, KDP_SCREEN_BOOT_TEXT_SIZE);
+    ASSERT(Length <= KDP_SCREEN_BOOT_TEXT_SIZE);
+
+    while ((Start < Length) && (KdpScreenBootText[Start] == ANSI_NULL))
+        Start++;
+
+    if (Length == KDP_SCREEN_BOOT_TEXT_SIZE)
+    {
+        while ((Start < Length) && (KdpScreenBootText[Start] != '\n'))
+            Start++;
+        if (Start < Length)
+            Start++;
+    }
+
+    KdpScreenBootText[Length] = ANSI_NULL;
+    if (Start < Length)
+        InbvDisplayString(KdpScreenBootText + Start);
+}
+
 BOOLEAN
 KdpScreenEnterStop(
     _In_ BOOLEAN Requested)
@@ -218,7 +267,8 @@ KdpScreenRelease(
 
     if (KdpScreenJoinedForStop)
     {
-        RemoveEntryList(&DispatchTable[KdScreen].KdProvidersList);
+        if (!KdpScreenJoinedEarly)
+            RemoveEntryList(&DispatchTable[KdScreen].KdProvidersList);
         KdpScreenInitialised = FALSE;
         KdpScreenJoinedForStop = FALSE;
     }
@@ -372,6 +422,93 @@ KdpScreenHasQueued(VOID)
 
 static
 VOID
+KdpScreenTrackChar(
+    _In_ CHAR Char)
+{
+    ASSERT(KdpScreenColumns <= KDP_SCREEN_ROW_SIZE);
+
+    if ((Char == '\n') || (Char == '\r'))
+    {
+        KdpScreenRowLength = 0;
+        return;
+    }
+
+    if (KdpScreenColumns == 0)
+        return;
+
+    ASSERT(KdpScreenRowLength < KdpScreenColumns);
+
+    KdpScreenRow[KdpScreenRowLength + 1] = Char;
+    KdpScreenRowLength++;
+
+    if (KdpScreenRowLength == KdpScreenColumns)
+        KdpScreenRowLength = 0;
+}
+
+static
+VOID
+KdpScreenEraseChar(VOID)
+{
+    ASSERT(KdpScreenColumns <= KDP_SCREEN_ROW_SIZE);
+    ASSERT(KdpScreenRow[0] == '\r');
+
+    if ((KdpScreenColumns == 0) || (KdpScreenRowLength == 0))
+        return;
+
+    ASSERT(KdpScreenRowLength < KdpScreenColumns);
+
+    KdpScreenRowLength--;
+
+    if (KdpScreenRowLength == 0)
+    {
+        InbvDisplayString("\r \r");
+        return;
+    }
+
+    KdpScreenRow[KdpScreenRowLength + 1] = ANSI_NULL;
+    InbvDisplayString(KdpScreenRow);
+}
+
+/*
+ * Draws what the providers printed. The boot video driver draws a backspace as
+ * a glyph, so the row is drawn again without its last character instead.
+ */
+static
+VOID
+KdpScreenDisplay(
+    _Inout_updates_z_(Length + 1) PCHAR Text,
+    _In_ ULONG Length)
+{
+    ULONG Start = 0;
+    ULONG Index;
+
+    ASSERT(Text != NULL);
+    ASSERT(Text[Length] == ANSI_NULL);
+
+    for (Index = 0; (Index < Length) && (Text[Index] != ANSI_NULL); Index++)
+    {
+        if (Text[Index] != '\b')
+        {
+            KdpScreenTrackChar(Text[Index]);
+            continue;
+        }
+
+        Text[Index] = ANSI_NULL;
+        if (Start < Index)
+            InbvDisplayString(Text + Start);
+
+        Start = Index + 1;
+        KdpScreenEraseChar();
+    }
+
+    ASSERT(Text[Index] == ANSI_NULL);
+
+    if (Start < Index)
+        InbvDisplayString(Text + Start);
+}
+
+static
+VOID
 NTAPI
 KdpScreenDpcRoutine(
     _In_ PKDPC Dpc,
@@ -398,7 +535,7 @@ KdpScreenDpcRoutine(
         if ((Length != 0) && KdpScreenCanDraw())
         {
             KdpScreenDpcText[Length] = ANSI_NULL;
-            InbvDisplayString(KdpScreenDpcText);
+            KdpScreenDisplay(KdpScreenDpcText, Length);
         }
 
         InterlockedExchange(&KdpScreenDrawing, 0);
@@ -412,14 +549,17 @@ static
 VOID
 KdpScreenFlushStop(VOID)
 {
+    ULONG Length;
+
     if (KdpScreenStopLength == 0)
         return;
 
-    KdpScreenStopText[KdpScreenStopLength] = ANSI_NULL;
+    Length = KdpScreenStopLength;
+    KdpScreenStopText[Length] = ANSI_NULL;
     KdpScreenStopLength = 0;
 
     if (KdpScreenCanDraw())
-        InbvDisplayString(KdpScreenStopText);
+        KdpScreenDisplay(KdpScreenStopText, Length);
 }
 
 static
@@ -487,9 +627,11 @@ KdpScreenPrint(
     _In_ PCCH String,
     _In_ ULONG Length)
 {
-    if ((Length != 0) && !InbvIsBootDriverInstalled() && (KdpEarlyScreenRoutine != NULL))
+    PKDP_EARLY_SCREEN_ROUTINE EarlyScreen = KdpEarlyScreenRoutine;
+
+    if ((Length != 0) && !KdpScreenInitialised && (EarlyScreen != NULL))
     {
-        KdpEarlyScreenRoutine(String, Length);
+        EarlyScreen(String, Length);
         return;
     }
 
@@ -533,16 +675,21 @@ KdpScreenInit(
 
     if (BootPhase == 0)
     {
-        /*
-         * The boot video driver is not there yet. Saying so keeps this
-         * provider out of the list until it can actually draw.
-         */
+        /* Until the boot video driver is there, only the early screen console can draw */
         DispatchTable->KdpPrintRoutine = KdpScreenPrint;
+        ASSERT(!KdpScreenJoinedEarly && !KdpScreenInitialised);
+        if (KdpEarlyScreenRoutine != NULL)
+        {
+            InsertTailList(&KdProviders, &DispatchTable->KdProvidersList);
+            KdpScreenJoinedEarly = TRUE;
+        }
         return STATUS_SUCCESS;
     }
 
     if (BootPhase == 1)
     {
+        KdpEarlyScreenRoutine = NULL;
+
         if (!InbvIsBootDriverInstalled())
             return STATUS_PORT_DISCONNECTED;
 
@@ -552,9 +699,11 @@ KdpScreenInit(
 
         if (!KdpScreenAcquire())
             KdpScreenSetConsole(TRUE);
+        KdpScreenReplayBoot();
         KdpScreenInitialised = TRUE;
 
-        InsertTailList(&KdProviders, &DispatchTable->KdProvidersList);
+        if (!KdpScreenJoinedEarly)
+            InsertTailList(&KdProviders, &DispatchTable->KdProvidersList);
     }
 
     return STATUS_SUCCESS;

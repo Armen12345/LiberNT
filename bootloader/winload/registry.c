@@ -387,7 +387,7 @@ OslLoadBootDrivers(
     PLIST_ENTRY Link, Next;
     PBOOT_DRIVER_NODE Node;
     PBOOT_DRIVER_LIST_ENTRY Driver;
-    PLDR_DATA_TABLE_ENTRY Module;
+    PKLDR_DATA_TABLE_ENTRY Module;
     PSTR FileName;
 
     OslDisableLegacyBootServices();
@@ -444,6 +444,67 @@ OslLoadBootDrivers(
     }
 
     return TRUE;
+}
+
+VOID
+OslLoadHalExtensions(
+    _Inout_ PLOADER_PARAMETER_BLOCK LoaderBlock,
+    _In_ PDK_DEVICE Device,
+    _In_ PCSTR Directory)
+{
+    PLIST_ENTRY Head = &LoaderBlock->Extension->HalExtensionModuleList;
+    PHAL_EXTENSION_MODULE_ENTRY Entry;
+    PKLDR_DATA_TABLE_ENTRY Module;
+    PVOID Initialize;
+    CHAR FileName[OSL_PATH_CHARS];
+    PCWSTR Name, End;
+    PUCHAR Data;
+    ULONG Type, Length, Index;
+
+    /* FIXME: Windows registers its HAL extensions in a way it does not document; this list is LiberNT's. */
+    Data = BlRegValue(OslSystemHive, OslOpenControlKey(L"Control", L"HAL", NULL), L"Extensions", &Type, &Length);
+    if (!Data || Type != REG_MULTI_SZ)
+        return;
+
+    Name = (PCWSTR)Data;
+    End = Name + Length / sizeof(WCHAR);
+    for (; Name < End && *Name != UNICODE_NULL; Name += Index + 1)
+    {
+        for (Index = 0; Name + Index < End && Name[Index] != UNICODE_NULL; Index++);
+        if (Name + Index == End)
+            return;
+        if (!NT_SUCCESS(RtlStringCbPrintfA(FileName, sizeof(FileName), "%ws", Name)))
+            continue;
+
+        if (!PeLoadModule(&LoaderBlock->LoadOrderListHead,
+                          Device,
+                          Directory,
+                          FileName,
+                          FileName,
+                          LoaderHalCode,
+                          0,
+                          &Module) ||
+            !PeResolveImports(&LoaderBlock->LoadOrderListHead, Device, Directory, Module))
+        {
+            FwPrint(L"The HAL extension %hs could not be loaded.\r\n", FileName);
+            continue;
+        }
+
+        Initialize = PeGetExport(&LoaderBlock->LoadOrderListHead, Module, "HalExtensionInitialize");
+        if (!Initialize)
+        {
+            FwPrint(L"The HAL extension %hs exports no HalExtensionInitialize.\r\n", FileName);
+            continue;
+        }
+
+        Entry = MmHeapAllocate(sizeof(*Entry));
+        if (!Entry)
+            return;
+        Entry->LdrEntry = PaToVa(Module);
+        Entry->InitializeRoutine = Initialize;
+        Entry->Phase1InitializeRoutine = PeGetExport(&LoaderBlock->LoadOrderListHead, Module, "HalExtensionPhase1Initialize");
+        InsertTailList(Head, &Entry->Link);
+    }
 }
 
 VOID

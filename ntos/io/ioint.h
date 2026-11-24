@@ -397,6 +397,7 @@ NTSTATUS IopDoLoadUnloadDriver(_In_opt_ PUNICODE_STRING DriverServiceName,
 NTSTATUS IopUnloadDriver(_In_ PUNICODE_STRING DriverServiceName, _In_ BOOLEAN UnloadPnpDrivers);
 NTSTATUS IopTryUnloadDriver(_In_ PDRIVER_OBJECT DriverObject, _In_ BOOLEAN Force);
 VOID IopUnloadUnusedPnpDriver(_In_ PDRIVER_OBJECT DriverObject);
+VOID IopRemoveDriverReinitialization(_In_ PDRIVER_OBJECT DriverObject);
 NTSTATUS IopNormalizeImagePath(_Inout_ PUNICODE_STRING ImagePath,
                                _In_ PUNICODE_STRING ServiceName);
 BOOLEAN IopCheckSafeBootDriver(_In_ HANDLE ServiceHandle, _In_ PUNICODE_STRING ServiceName);
@@ -420,9 +421,9 @@ extern PULONG IopGroupIndex;
 extern PUNICODE_STRING PiInitGroupOrderTable;
 extern ULONG PiInitGroupOrderTableCount;
 
-NTSTATUS LdrProcessDriverModule(_In_ PLDR_DATA_TABLE_ENTRY LdrEntry,
+NTSTATUS LdrProcessDriverModule(_In_ PKLDR_DATA_TABLE_ENTRY LdrEntry,
                                 _In_ PUNICODE_STRING FileName,
-                                _Out_ PLDR_DATA_TABLE_ENTRY *ModuleObject);
+                                _Out_ PKLDR_DATA_TABLE_ENTRY *ModuleObject);
 NTSTATUS IopLoadServiceModule(_In_ HANDLE ServiceHandle,
                               _Out_ PDRIVER_OBJECT *DriverObject);
 

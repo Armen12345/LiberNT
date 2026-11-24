@@ -54,6 +54,9 @@ extern void func_FrameMetrics(void);
 extern void func_GetClassInfo(void);
 extern void func_GetDCEx(void);
 extern void func_GetProp(void);
+extern void func_SetWindowPlacementMaximized(void);
+extern void func_MdiCreateDelivery(void);
+extern void func_RetainedDCResize(void);
 extern void func_WindowRegionDC(void);
 extern void func_GetIconInfo(void);
 extern void func_GetKeyState(void);
@@ -88,8 +91,10 @@ extern void func_MenuUI(void);
 extern void func_MenuItemData(void);
 extern void func_MenuBarBackground(void);
 extern void func_MessageStateAnalyzer(void);
+extern void func_MultiMonitor(void);
 extern void func_MinimizedPosition(void);
 extern void func_ModernUser32(void);
+extern void func_MonitorFromRect(void);
 extern void func_NestedActivation(void);
 extern void func_NestedWindowPos(void);
 extern void func_NcPaintRgn(void);
@@ -209,6 +214,9 @@ const struct test winetest_testlist[] =
     { "GetClassInfo", func_GetClassInfo },
     { "GetDCEx", func_GetDCEx },
     { "GetProp", func_GetProp },
+    { "SetWindowPlacementMaximized", func_SetWindowPlacementMaximized },
+    { "MdiCreateDelivery", func_MdiCreateDelivery },
+    { "RetainedDCResize", func_RetainedDCResize },
     { "WindowRegionDC", func_WindowRegionDC },
     { "GetIconInfo", func_GetIconInfo },
     { "GetKeyState", func_GetKeyState },
@@ -243,8 +251,10 @@ const struct test winetest_testlist[] =
     { "MenuItemData", func_MenuItemData },
     { "MenuBarBackground", func_MenuBarBackground },
     { "MessageStateAnalyzer", func_MessageStateAnalyzer },
+    { "MultiMonitor", func_MultiMonitor },
     { "MinimizedPosition", func_MinimizedPosition },
     { "ModernUser32", func_ModernUser32 },
+    { "MonitorFromRect", func_MonitorFromRect },
     { "NestedActivation", func_NestedActivation },
     { "NestedWindowPos", func_NestedWindowPos },
     { "NcPaintRgn", func_NcPaintRgn },

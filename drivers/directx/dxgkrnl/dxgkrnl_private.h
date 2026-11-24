@@ -40,33 +40,6 @@
 
 #include "../wddm_cleanroom_gate.h"
 
-/* ---- Minimum OS version for dxgkrnl ------------------------------------ */
-/*
- * dxgkrnl.sys uses the Windows 8 kernel API declaration set.
- * Override both _WIN32_WINNT and NTDDI_VERSION before including any kernel
- * headers so that those declarations are visible.
- *
- * The separately selected DXGKDDI interface level is WDDM 2.0; this NT target
- * controls kernel declarations and does not lower that graphics contract.
- *
- * Windows 8 is the floor rather than Windows 7 because registering the
- * miniport's runtime power components uses the Power Framework -
- * PoFxRegisterDevice, PoFxActivateComponent and the PO_FX_DEVICE description -
- * which <potypes.h> declares only from NTDDI_WIN8 and which ntoskrnl exports
- * at the same level.  Functions such as PsSetCreateProcessNotifyRoutineEx
- * remain declared.
- *
- * The ReactOS build system sets _WIN32_WINNT=0x0502 (Server 2003) globally,
- * but dxgkrnl is a WDDM driver that only loads on Vista+.  The
- * sdkddkver.h consistency check requires (NTDDI_VERSION >> 16) == _WIN32_WINNT,
- * so both values must be updated together, and must agree with the values the
- * module's CMakeLists.txt puts on the command line.
- */
-#undef  _WIN32_WINNT
-#define _WIN32_WINNT  0x0602    /* Windows 8 */
-#undef  NTDDI_VERSION
-#define NTDDI_VERSION 0x06020000 /* NTDDI_WIN8 */
-
 /* ---- Standard kernel headers ------------------------------------------- */
 #include <ntifs.h>
 #include <ntddk.h>
@@ -116,11 +89,11 @@
  */
 #include <dispmprt.h>
 #include <d3dkmthk.h>
-#include <reactos/drivers/directx/dxgmms2.h>
+#include <libernt/drivers/directx/dxgmms2.h>
 #include "d3dkmt.h"
 
 /* ---- ReactOS WDDM private adapter-level interface ---------------------- */
-#include <reactos/rddm/rxgkinterface.h>
+#include <libernt/rddm/rxgkinterface.h>
 
 struct _DXGK_REDIRECTION_SURFACE_CREATE;
 struct _VIDEO_MODE_INFORMATION;
@@ -156,13 +129,13 @@ extern NTKERNELAPI PVOID MmSystemRangeStart;
 
 /* ---- Debug helpers ----------------------------------------------------- */
 /*
- * Use the full path <reactos/debug.h> to avoid accidentally finding the
+ * Use the full path <libernt/debug.h> to avoid accidentally finding the
  * local dxgkrnl "debug.h" via the angle-bracket search path.
- * The local "debug.h" must come after <reactos/debug.h> because it uses
+ * The local "debug.h" must come after <libernt/debug.h> because it uses
  * DPRINT / DPRINT1 macros defined by the system header.
  */
 #define NDEBUG
-#include <reactos/debug.h>
+#include <libernt/debug.h>
 #include "debug.h"
 
 /* Pool tag for display/vidpn-related allocations */
@@ -648,6 +621,28 @@ typedef struct _DXGKP_ACPI_EVENTS
  *
  * Stored in the FDO's DeviceExtension.  Lifetime: AddDevice → RemoveDevice.
  * ====================================================================== */
+#define DXGKRNL_MAX_SOURCE_PRIMARIES 16
+
+/* The primary a further source of an extended desktop scans out; the desktop source uses the adapter's shared primary */
+typedef struct _DXGKRNL_SOURCE_PRIMARY
+{
+    HANDLE                      AllocationHandle;
+    D3DKMT_HANDLE               ResourceHandle;
+    D3DKMT_HANDLE               GlobalShareHandle;
+    ULONG                       Width;
+    ULONG                       Height;
+    D3DDDIFORMAT                Format;
+    BOOLEAN                     ScannedOut;
+} DXGKRNL_SOURCE_PRIMARY, *PDXGKRNL_SOURCE_PRIMARY;
+
+typedef struct _DXGKRNL_SOURCE_POINTER
+{
+    LONG                        X;
+    LONG                        Y;
+    BOOLEAN                     Visible;
+    BOOLEAN                     ShapeValid;
+} DXGKRNL_SOURCE_POINTER, *PDXGKRNL_SOURCE_POINTER;
+
 struct _DXGKRNL_ADAPTER
 {
     /* Back-pointer to the per-miniport driver context. */
@@ -1173,6 +1168,8 @@ struct _DXGKRNL_ADAPTER
     ULONG                       SharedPrimaryHeight;
     D3DDDIFORMAT                SharedPrimaryFormat;
     BOOLEAN                     SharedPrimaryIsGopBacked;
+    /* Guarded by SharedPrimaryMutex */
+    DXGKRNL_SOURCE_PRIMARY      SourcePrimaries[DXGKRNL_MAX_SOURCE_PRIMARIES];
     D3DKMT_HANDLE               SharedShadowResourceHandle;
     D3DKMT_HANDLE               SharedShadowGlobalShareHandle;
     HANDLE                      SharedShadowAllocationHandle;
@@ -1304,10 +1301,8 @@ struct _DXGKRNL_ADAPTER
     BOOLEAN                     PointerHwSupported;
     ULONG                       PointerMaxWidth;
     ULONG                       PointerMaxHeight;
-    LONG                        PointerX;
-    LONG                        PointerY;
-    BOOLEAN                     PointerVisible;
-    BOOLEAN                     PointerShapeValid;
+    /* One pointer per VidPn source, driven by that source's display device */
+    DXGKRNL_SOURCE_POINTER      Pointers[DXGKRNL_MAX_SOURCE_PRIMARIES];
 
     /*
      * Set when the miniport was already stopped through
@@ -4100,6 +4095,19 @@ VOID
 DxgkDisplayUnregister(
     _In_ PDXGKRNL_ADAPTER Adapter);
 
+VOID
+DxgkDisplayInitializeGlobals(VOID);
+
+VOID
+DxgkDisplayRegisterSourceDisplays(
+    _In_ PDXGKRNL_ADAPTER Adapter);
+
+NTSTATUS
+DxgkDisplayResolveVideoDevice(
+    _In_ PCUNICODE_STRING DeviceName,
+    _Out_ PDXGKRNL_ADAPTER *Adapter,
+    _Out_ D3DDDI_VIDEO_PRESENT_SOURCE_ID *SourceId);
+
 /*
  * Display dispatch helpers — called from dxgkrnl dispatch routines
  * to route IRPs targeting \Device\Video0 to the display handler.
@@ -4150,6 +4158,25 @@ DxgkDisplayDetachWin32kSession(
 
 VOID
 DxgkDisplayPresentBootScreen(
+    _In_ PDXGKRNL_ADAPTER Adapter);
+
+NTSTATUS
+DxgkPresentScanOutSourcePrimary(
+    _In_ PDXGKRNL_ADAPTER Adapter,
+    _In_ PDXGKVMM_ALLOCATION Allocation,
+    _In_ D3DDDI_VIDEO_PRESENT_SOURCE_ID VidPnSourceId,
+    _In_ ULONG Width,
+    _In_ ULONG Height);
+
+BOOLEAN
+DxgkVidPnGetSourcePrimarySize(
+    _In_ PDXGKRNL_ADAPTER Adapter,
+    _In_ D3DDDI_VIDEO_PRESENT_SOURCE_ID VidPnSourceId,
+    _Out_ PULONG Width,
+    _Out_ PULONG Height);
+
+VOID
+DxgkpSyncSourcePrimariesLocked(
     _In_ PDXGKRNL_ADAPTER Adapter);
 
 NTSTATUS

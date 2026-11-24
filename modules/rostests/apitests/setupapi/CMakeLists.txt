@@ -6,10 +6,14 @@ list(APPEND SOURCE
     DeviceClassName.c
     DeviceDescription.c
     DeviceExtension.c
+    KmdfServiceSection.c
+    PackageRootDevice.c
     DriverFeatureScore.c
     DriverFilesNeedReboot.c
     DriverPackageSignerScore.c
+    HalDeviceIds.c
     DevicePdoName.c
+    DisableableParents.c
     DevicePowerOnDisable.c
     DeviceRemoveVeto.c
     HostBridgeStart.c
@@ -30,7 +34,10 @@ list(APPEND SOURCE
     SetupDiGetActualModelsSection.c
     SetupInstallFile.c
     SetupInstallRegisterDlls.c
+    AddRegRegistryView.c
     SetupInstallServicesFromInfSectionEx.c
+    ReenumerateFlags.c
+    ServiceFilterNoLegacyNode.c
     SoftwareComponent.c
     SysButtonDevices.c
     UsbHubInformation.c

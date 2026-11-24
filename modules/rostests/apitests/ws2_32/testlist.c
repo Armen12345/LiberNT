@@ -32,12 +32,16 @@ extern void func_loopback_pingpong(void);
 extern void func_recv(void);
 extern void func_send(void);
 extern void func_sendto_neighbor(void);
+extern void func_tcp_connected_options(void);
+extern void func_tcp_keepalive(void);
+extern void func_tcp_nodelay(void);
 extern void func_udp_connreset(void);
 extern void func_udp_queue(void);
 extern void func_udp_quic(void);
 extern void func_WSAAsync(void);
 extern void func_WSAIoctl(void);
 extern void func_WSARecv(void);
+extern void func_WSASendMsg(void);
 extern void func_WSABufferArray(void);
 extern void func_WSAStartup(void);
 
@@ -73,12 +77,16 @@ const struct test winetest_testlist[] =
     { "recv", func_recv },
     { "send", func_send },
     { "sendto_neighbor", func_sendto_neighbor },
+    { "tcp_connected_options", func_tcp_connected_options },
+    { "tcp_keepalive", func_tcp_keepalive },
+    { "tcp_nodelay", func_tcp_nodelay },
     { "udp_connreset", func_udp_connreset },
     { "udp_queue", func_udp_queue },
     { "udp_quic", func_udp_quic },
     { "WSAAsync", func_WSAAsync },
     { "WSAIoctl", func_WSAIoctl },
     { "WSARecv", func_WSARecv },
+    { "WSASendMsg", func_WSASendMsg },
     { "WSABufferArray", func_WSABufferArray },
     { "WSAStartup", func_WSAStartup },
     { 0, 0 }

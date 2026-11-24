@@ -60,12 +60,12 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 # Versioning
-include(sdk/include/reactos/version.cmake)
+include(sdk/include/libernt/version.cmake)
 
 # Build stamp: the branch, commit and time the build was made from. It is
 # written once here so the first compile has it, and again at every build so a
 # tree that moved is stamped with where it moved to.
-set(LIBERNT_BUILDSTAMP_HEADER "${REACTOS_BINARY_DIR}/sdk/include/reactos/buildstamp.h")
+set(LIBERNT_BUILDSTAMP_HEADER "${REACTOS_BINARY_DIR}/sdk/include/libernt/buildstamp.h")
 execute_process(COMMAND ${CMAKE_COMMAND}
     -DSOURCE_DIR=${REACTOS_SOURCE_DIR}
     -DOUTPUT=${LIBERNT_BUILDSTAMP_HEADER}
@@ -183,7 +183,7 @@ if(NOT CMAKE_CROSSCOMPILING)
     add_subdirectory(sdk/tools)
     add_subdirectory(sdk/lib)
 
-    set(NATIVE_TARGETS asmpp bin2c gas2armasm widl gendib cabman fatten hpp mkhive mkisofs obj2bin spec2def geninc mkshelllink utf16le windmc xml2sdb)
+    set(NATIVE_TARGETS armefi asmpp bin2c gas2armasm widl gendib cabman fatten hpp mkhive mkisofs obj2bin spec2def geninc mkshelllink utf16le windmc xml2sdb)
     if(NOT CMAKE_HOST_WIN32)
         list(APPEND NATIVE_TARGETS ntfsimg)
     endif()
@@ -265,12 +265,12 @@ Enable this if the module uses typeid or dynamic_cast. You will probably need to
     math(EXPR _NT_VALUE "${REACTOS_TARGET_NT} + 0")
 
     add_definitions(-DWINVER=${REACTOS_TARGET_NT}
-                    -D_WIN32_IE=0x603
+                    -D_WIN32_IE=0x0A00
                     -D_WIN32_WINNT=${REACTOS_TARGET_NT}
                     -D_WIN32_WINDOWS=${REACTOS_TARGET_NT}
                     -D_SETUPAPI_VER=${REACTOS_TARGET_NT}
                     -DMINGW_HAS_SECURE_API=1
-                    -DDXGKDDI_INTERFACE_VERSION=0x1052 # Vista
+                    -DDXGKDDI_INTERFACE_VERSION=0x11007
                     -DDLL_EXPORT_VERSION=${DLL_EXPORT_VERSION}
                     -DVER_PRODUCTMAJORVERSION=${_NT_MAJOR}
                     -DVER_PRODUCTMINORVERSION=${_NT_MINOR})
@@ -312,11 +312,10 @@ Enable this if the module uses typeid or dynamic_cast. You will probably need to
         add_definitions(-D_AMD64_ -D__x86_64__ -D_WIN64)
         set(ARCH_64BIT TRUE)
     elseif(ARCH STREQUAL "arm")
-        # _M_ARM is already defined by toolchain
-        add_definitions(-D_ARM_ -D__arm__ -DWIN32)
-        if(SARCH STREQUAL "omap3-zoom2")
-            add_definitions(-D_ZOOM2_)
+        if(NOT (MSVC AND CMAKE_C_COMPILER_ID STREQUAL "Clang"))
+            add_compile_definitions(_M_ARM=7 _M_ARMT=7 _M_THUMB=7)
         endif()
+        add_definitions(-D_ARM_ -D__arm__ -DWIN32)
     elseif(ARCH STREQUAL "riscv64")
         # Clang defines _M_RISCV64 with the Microsoft-compatible value (100).
         add_compile_definitions(_RISCV64_ _WIN64)
@@ -388,23 +387,19 @@ Enable this if the module uses typeid or dynamic_cast. You will probably need to
         sdk/include/ddk
         sdk/include/ndk
         sdk/include/psdk
-        sdk/include/reactos
-        sdk/include/reactos/libs
+        sdk/include/libernt
+        sdk/include/libernt/libs
         sdk/include/vcruntime
         sdk/include/winrt
         ${REACTOS_BINARY_DIR}/sdk/include
         ${REACTOS_BINARY_DIR}/sdk/include/psdk
         ${REACTOS_BINARY_DIR}/sdk/include/ddk
         ${REACTOS_BINARY_DIR}/sdk/include/dxsdk
-        ${REACTOS_BINARY_DIR}/sdk/include/reactos
-        ${REACTOS_BINARY_DIR}/sdk/include/reactos/mc
+        ${REACTOS_BINARY_DIR}/sdk/include/libernt
+        ${REACTOS_BINARY_DIR}/sdk/include/libernt/mc
         sdk/include/dxsdk
         sdk/lib/pseh/include
     )
-
-    if(ARCH STREQUAL "arm")
-        include_directories(${REACTOS_SOURCE_DIR}/sdk/include/reactos/arm)
-    endif()
 
     add_dependency_header()
 
@@ -419,9 +414,10 @@ Enable this if the module uses typeid or dynamic_cast. You will probably need to
 
     add_custom_target(submodules)
 
-    #begin with boot so reactos_cab target is defined before all other modules
-    add_subdirectory(boot)
+    #begin with image so the livecd_files target is defined before all other modules
+    add_subdirectory(image ${CMAKE_BINARY_DIR}/boot)
     add_subdirectory(bootloader)
+    add_subdirectory(image/bcd ${CMAKE_BINARY_DIR}/bootloader/image)
     add_subdirectory(base)
     add_subdirectory(dll)
     set(FEX_ARM64EC_AVAILABLE OFF)
@@ -461,7 +457,7 @@ Enable this if the module uses typeid or dynamic_cast. You will probably need to
     # Create {bootcd, livecd, preinstall}.lst
     create_iso_lists()
 
-    file(MAKE_DIRECTORY ${REACTOS_BINARY_DIR}/sdk/include/reactos)
+    file(MAKE_DIRECTORY ${REACTOS_BINARY_DIR}/sdk/include/libernt)
 
     add_dependency_footer()
 endif()

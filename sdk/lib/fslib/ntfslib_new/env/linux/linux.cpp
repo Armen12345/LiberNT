@@ -10,9 +10,17 @@
 #include <fcntl.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
+#include <sys/file.h>
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
+
+#include <algorithm>
+#include <memory>
+#include <mutex>
+#include <unordered_map>
+#include <vector>
 
 #include <ntfslib_new.h>
 #include <ntfslib_new_internal.h>
@@ -20,6 +28,82 @@
 
 static int NtfsImageFd = -1;
 static BOOLEAN NtfsImageWritable = FALSE;
+static clockid_t NtfsTimestampClock = CLOCK_REALTIME;
+
+/* Write-through: every write reaches the image before the cached copy changes. */
+#define NTFS_CACHE_PAGE_SIZE 4096u
+#define NTFS_CACHE_PAGE_LIMIT 16384u
+#define NTFS_CACHE_READ_LIMIT (64u * 1024u)
+
+struct NtfsCachePageFree
+{
+    void operator()(UCHAR* Data) const { free(Data); }
+};
+
+struct NtfsCachePage
+{
+    ULONGLONG Index;
+    ULONG ValidBytes;
+    bool Referenced;
+    std::unique_ptr<UCHAR, NtfsCachePageFree> Data;
+};
+
+static std::mutex NtfsCacheLock;
+static std::vector<NtfsCachePage> NtfsCachePages;
+static std::unordered_map<ULONGLONG, size_t> NtfsCacheMap;
+static size_t NtfsCacheHand;
+static UCHAR NtfsReadAhead[NTFS_CACHE_READ_LIMIT];
+static ULONGLONG NtfsReadAheadOffset;
+static ULONG NtfsReadAheadLength;
+static ULONGLONG NtfsNextPageOffset = UINT64_MAX;
+static ULONGLONG NtfsWriteGeneration;
+static thread_local bool NtfsReadingFileData;
+
+extern "C" NTSTATUS
+NtfsReadFileLinux(PNtfsFileRecord File, PUCHAR Buffer, PULONG Length, ULONGLONG Offset)
+{
+    NtfsReadingFileData = true;
+    NTSTATUS Status = NtfsFileRecordCopyData(File, TypeData, NULL, Buffer, Length, Offset);
+    NtfsReadingFileData = false;
+    return Status;
+}
+
+extern "C" ULONGLONG
+NtfsDiskWriteGenerationLinux(void)
+{
+    std::lock_guard<std::mutex> Guard(NtfsCacheLock);
+
+    return NtfsWriteGeneration;
+}
+
+extern "C" int
+NtfsDiskFdLinux(void)
+{
+    return NtfsImageFd;
+}
+
+extern "C" void
+NtfsUseWritebackClockLinux(BOOLEAN Enable)
+{
+#ifdef CLOCK_REALTIME_COARSE
+    NtfsTimestampClock = Enable ? CLOCK_REALTIME_COARSE : CLOCK_REALTIME;
+#else
+    UNREFERENCED_PARAMETER(Enable);
+    NtfsTimestampClock = CLOCK_REALTIME;
+#endif
+}
+
+static void
+NtfsCacheClear(void)
+{
+    std::lock_guard<std::mutex> Guard(NtfsCacheLock);
+
+    NtfsCacheMap.clear();
+    NtfsCachePages.clear();
+    NtfsCacheHand = 0;
+    NtfsReadAheadLength = 0;
+    NtfsNextPageOffset = UINT64_MAX;
+}
 
 BOOLEAN
 NtfsIsNameInExpressionFallback(
@@ -42,15 +126,30 @@ NtfsDiskInitializeLinuxInternal(
     if (!Path)
         return STATUS_INVALID_PARAMETER;
 
-    NewFd = open(Path,
-                 (Writable ? O_RDWR : O_RDONLY) | O_CLOEXEC);
-    if (NewFd < 0)
+    /* A mount that was just unmounted holds the image until its daemon has stored the last changes. */
+    for (unsigned Attempt = 0;; Attempt++)
     {
-        if (errno == EACCES || errno == EROFS)
-            return Writable
-                ? STATUS_MEDIA_WRITE_PROTECTED
-                : STATUS_ACCESS_DENIED;
-        return STATUS_NOT_FOUND;
+        const struct timespec Pause = {0, 10 * 1000 * 1000};
+        NTSTATUS Status;
+
+        NewFd = open(Path,
+                     (Writable ? O_RDWR | O_EXCL : O_RDONLY) | O_CLOEXEC);
+        if (NewFd >= 0 && flock(NewFd, (Writable ? LOCK_EX : LOCK_SH) | LOCK_NB) == 0)
+            break;
+        if (NewFd < 0 && errno != EBUSY)
+        {
+            if (errno == EACCES || errno == EROFS)
+                return Writable
+                    ? STATUS_MEDIA_WRITE_PROTECTED
+                    : STATUS_ACCESS_DENIED;
+            return STATUS_NOT_FOUND;
+        }
+        Status = NewFd < 0 || errno == EWOULDBLOCK ? STATUS_SHARING_VIOLATION : STATUS_INVALID_DEVICE_STATE;
+        if (NewFd >= 0)
+            close(NewFd);
+        if (Status != STATUS_SHARING_VIOLATION || Attempt == 200)
+            return Status;
+        nanosleep(&Pause, NULL);
     }
 
     do
@@ -74,6 +173,7 @@ NtfsDiskInitializeLinuxInternal(
 
     if (NtfsImageFd >= 0)
         close(NtfsImageFd);
+    NtfsCacheClear();
     NtfsImageFd = NewFd;
     NtfsImageWritable = Writable;
 
@@ -110,7 +210,9 @@ NtfsDiskCloseLinux(void)
         close(NtfsImageFd);
         NtfsImageFd = -1;
     }
+    NtfsCacheClear();
     NtfsImageWritable = FALSE;
+    NtfsTimestampClock = CLOCK_REALTIME;
 }
 
 extern "C" void*
@@ -167,7 +269,7 @@ NtfsQuerySystemTime(_Out_ PULONGLONG NtfsTime)
 
     if (!NtfsTime)
         return STATUS_INVALID_PARAMETER;
-    if (clock_gettime(CLOCK_REALTIME, &Current) != 0)
+    if (clock_gettime(NtfsTimestampClock, &Current) != 0)
         return STATUS_INVALID_DEVICE_STATE;
     if (Current.tv_nsec < 0 ||
         Current.tv_nsec >= INT64_C(1000000000))
@@ -198,6 +300,126 @@ NtfsQuerySystemTime(_Out_ PULONGLONG NtfsTime)
     return STATUS_SUCCESS;
 }
 
+static NTSTATUS
+NtfsReadImage(_In_ ULONGLONG Offset,
+              _In_ ULONG Length,
+              _Inout_ PUCHAR Buffer,
+              _Out_opt_ PULONG BytesRead)
+{
+    ULONG Completed = 0;
+
+    if (BytesRead)
+        *BytesRead = 0;
+    while (Completed < Length)
+    {
+        ssize_t Result = pread(NtfsImageFd,
+                               Buffer + Completed,
+                               Length - Completed,
+                               (off_t)(Offset + Completed));
+        if (Result > 0)
+        {
+            Completed += (ULONG)Result;
+            continue;
+        }
+        if (Result < 0 && errno == EINTR)
+            continue;
+        if (Result == 0)
+        {
+            if (BytesRead)
+                *BytesRead = Completed;
+            return STATUS_END_OF_FILE;
+        }
+        return errno == EACCES ? STATUS_ACCESS_DENIED : STATUS_INVALID_DEVICE_STATE;
+    }
+
+    if (BytesRead)
+        *BytesRead = Completed;
+    return STATUS_SUCCESS;
+}
+
+static bool
+NtfsReadAheadContains(ULONGLONG Offset)
+{
+    return Offset >= NtfsReadAheadOffset && Offset - NtfsReadAheadOffset < NtfsReadAheadLength;
+}
+
+static NtfsCachePage*
+NtfsCacheGetPage(_In_ ULONGLONG PageIndex, _Out_ NTSTATUS* Status)
+{
+    auto Existing = NtfsCacheMap.find(PageIndex);
+    NtfsCachePage* Page;
+    size_t Slot;
+    ULONG ValidBytes;
+
+    if (Existing != NtfsCacheMap.end())
+    {
+        Page = &NtfsCachePages[Existing->second];
+        Page->Referenced = true;
+        *Status = STATUS_SUCCESS;
+        return Page;
+    }
+
+    if (NtfsCachePages.size() < NTFS_CACHE_PAGE_LIMIT)
+    {
+        NtfsCachePages.push_back({});
+        Slot = NtfsCachePages.size() - 1;
+        NtfsCachePages[Slot].Data.reset((UCHAR*)malloc(NTFS_CACHE_PAGE_SIZE));
+        if (!NtfsCachePages[Slot].Data)
+        {
+            NtfsCachePages.pop_back();
+            *Status = STATUS_INSUFFICIENT_RESOURCES;
+            return NULL;
+        }
+    }
+    else
+    {
+        for (;;)
+        {
+            Slot = NtfsCacheHand;
+            NtfsCacheHand = (NtfsCacheHand + 1) % NtfsCachePages.size();
+            if (!NtfsCachePages[Slot].Referenced)
+                break;
+            NtfsCachePages[Slot].Referenced = false;
+        }
+        NtfsCacheMap.erase(NtfsCachePages[Slot].Index);
+    }
+
+    Page = &NtfsCachePages[Slot];
+    ULONGLONG Offset = PageIndex * NTFS_CACHE_PAGE_SIZE;
+    if (Offset == NtfsNextPageOffset && !NtfsReadAheadContains(Offset) &&
+        Offset <= INT64_MAX - sizeof(NtfsReadAhead))
+    {
+        NtfsReadAheadOffset = Offset;
+        *Status = NtfsReadImage(Offset, sizeof(NtfsReadAhead), NtfsReadAhead, &NtfsReadAheadLength);
+        if (!NT_SUCCESS(*Status) && *Status != STATUS_END_OF_FILE)
+            NtfsReadAheadLength = 0;
+    }
+    NtfsNextPageOffset = Offset + NTFS_CACHE_PAGE_SIZE;
+    if (NtfsReadAheadContains(Offset))
+    {
+        ULONG Start = (ULONG)(Offset - NtfsReadAheadOffset);
+        ValidBytes = std::min<ULONG>(NTFS_CACHE_PAGE_SIZE, NtfsReadAheadLength - Start);
+        memcpy(Page->Data.get(), NtfsReadAhead + Start, ValidBytes);
+        *Status = STATUS_SUCCESS;
+    }
+    else
+        *Status = NtfsReadImage(Offset, NTFS_CACHE_PAGE_SIZE, Page->Data.get(), &ValidBytes);
+    if (*Status == STATUS_END_OF_FILE)
+        *Status = STATUS_SUCCESS;
+    if (!NT_SUCCESS(*Status))
+    {
+        Page->ValidBytes = 0;
+        Page->Index = ~(ULONGLONG)0;
+        Page->Referenced = false;
+        return NULL;
+    }
+    Page->Index = PageIndex;
+    Page->ValidBytes = ValidBytes;
+    Page->Referenced = true;
+    NtfsCacheMap[PageIndex] = Slot;
+    return Page;
+}
+
 extern "C" NTSTATUS
 NtfsReadVolume(_In_ ULONGLONG Offset,
                _In_ ULONG Length,
@@ -214,33 +436,100 @@ NtfsReadVolume(_In_ ULONGLONG Offset,
     {
         return STATUS_FILE_CORRUPT_ERROR;
     }
+    if (Length > NTFS_CACHE_READ_LIMIT || (NtfsReadingFileData && Length >= NTFS_CACHE_PAGE_SIZE))
+        return NtfsReadImage(Offset, Length, Buffer, NULL);
 
+    std::lock_guard<std::mutex> Guard(NtfsCacheLock);
     while (Completed < Length)
     {
-        ssize_t Result = pread(NtfsImageFd,
-                               Buffer + Completed,
-                               Length - Completed,
-                               (off_t)(Offset + Completed));
-        if (Result > 0)
-        {
-            Completed += (ULONG)Result;
-            continue;
-        }
-        if (Result < 0 && errno == EINTR)
-            continue;
-        if (Result == 0)
-            return STATUS_END_OF_FILE;
-        return errno == EACCES ? STATUS_ACCESS_DENIED : STATUS_INVALID_DEVICE_STATE;
-    }
+        ULONGLONG Position = Offset + Completed;
+        ULONG PageOffset = (ULONG)(Position % NTFS_CACHE_PAGE_SIZE);
+        ULONG Chunk = NTFS_CACHE_PAGE_SIZE - PageOffset;
+        NTSTATUS Status;
+        NtfsCachePage* Page = NtfsCacheGetPage(Position / NTFS_CACHE_PAGE_SIZE, &Status);
 
+        if (!Page)
+            return Status;
+        if (Chunk > Length - Completed)
+            Chunk = Length - Completed;
+        if (PageOffset + Chunk > Page->ValidBytes)
+            return STATUS_END_OF_FILE;
+        memcpy(Buffer + Completed, Page->Data.get() + PageOffset, Chunk);
+        Completed += Chunk;
+    }
     return STATUS_SUCCESS;
 }
+
+static void
+NtfsCacheApplyWrite(_In_ ULONGLONG Offset,
+                    _In_ ULONG Length,
+                    _In_ const UCHAR* Buffer,
+                    _In_ bool Metadata = true)
+{
+    std::lock_guard<std::mutex> Guard(NtfsCacheLock);
+    ULONG Completed = 0;
+
+    if (Length == 0)
+        return;
+    if (Metadata)
+        ++NtfsWriteGeneration;
+    NtfsReadAheadLength = 0;
+    if (NtfsCacheMap.empty())
+        return;
+    while (Completed < Length)
+    {
+        ULONGLONG Position = Offset + Completed;
+        ULONG PageOffset = (ULONG)(Position % NTFS_CACHE_PAGE_SIZE);
+        ULONG Chunk = NTFS_CACHE_PAGE_SIZE - PageOffset;
+        auto Existing = NtfsCacheMap.find(Position / NTFS_CACHE_PAGE_SIZE);
+
+        if (Chunk > Length - Completed)
+            Chunk = Length - Completed;
+        if (Existing != NtfsCacheMap.end())
+        {
+            NtfsCachePage* Page = &NtfsCachePages[Existing->second];
+
+            /* Racing data writers may land in either order: drop the page, the next read takes the image's. */
+            if (Metadata && PageOffset <= Page->ValidBytes)
+            {
+                memcpy(Page->Data.get() + PageOffset, Buffer + Completed, Chunk);
+                if (PageOffset + Chunk > Page->ValidBytes)
+                    Page->ValidBytes = PageOffset + Chunk;
+            }
+            else
+            {
+                Page->Index = ~(ULONGLONG)0;
+                Page->ValidBytes = 0;
+                Page->Referenced = false;
+                NtfsCacheMap.erase(Existing);
+            }
+        }
+        Completed += Chunk;
+    }
+}
+
+static NTSTATUS
+NtfsWriteImage(ULONGLONG Offset, ULONG Length, const UCHAR* Buffer, bool Metadata);
 
 extern "C" NTSTATUS
 NtfsWriteVolume(_In_ ULONGLONG Offset,
                 _In_ ULONG Length,
                 _Inout_ PUCHAR Buffer)
 {
+    return NtfsWriteImage(Offset, Length, Buffer, true);
+}
+
+/* File data only, from any thread: leaves the metadata write generation alone. */
+extern "C" NTSTATUS
+NtfsWriteFileDataLinux(ULONGLONG Offset, const UCHAR* Buffer, ULONG Length)
+{
+    return NtfsWriteImage(Offset, Length, Buffer, false);
+}
+
+static NTSTATUS
+NtfsWriteImage(ULONGLONG Offset, ULONG Length, const UCHAR* Buffer, bool Metadata)
+{
+    NTSTATUS Status = STATUS_SUCCESS;
     ULONG Completed = 0;
 
     if (NtfsImageFd < 0)
@@ -269,15 +558,18 @@ NtfsWriteVolume(_In_ ULONGLONG Offset,
         if (Result < 0 && errno == EINTR)
             continue;
         if (errno == EACCES || errno == EROFS)
-            return STATUS_MEDIA_WRITE_PROTECTED;
-        if (errno == ENOSPC)
-            return STATUS_DISK_FULL;
-        if (errno == EFBIG)
-            return STATUS_FILE_TOO_LARGE;
-        return STATUS_INVALID_DEVICE_STATE;
+            Status = STATUS_MEDIA_WRITE_PROTECTED;
+        else if (errno == ENOSPC)
+            Status = STATUS_DISK_FULL;
+        else if (errno == EFBIG)
+            Status = STATUS_FILE_TOO_LARGE;
+        else
+            Status = STATUS_INVALID_DEVICE_STATE;
+        break;
     }
 
-    return STATUS_SUCCESS;
+    NtfsCacheApplyWrite(Offset, Completed, Buffer, Metadata);
+    return Status;
 }
 
 extern "C" NTSTATUS

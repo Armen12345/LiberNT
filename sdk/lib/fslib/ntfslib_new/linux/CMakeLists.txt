@@ -119,6 +119,11 @@ if(NTFSLIB_BUILD_FUSE)
 endif()
 
 if(BUILD_TESTING)
+    add_executable(ntfslib_disk_cache_test tests/disk_cache.cpp)
+    target_include_directories(ntfslib_disk_cache_test PRIVATE "${NTFSLIB_ROOT}/include/internal")
+    target_link_libraries(ntfslib_disk_cache_test PRIVATE ntfslib_linux)
+    add_test(NAME ntfslib_linux_disk_cache COMMAND ntfslib_disk_cache_test)
+
     add_executable(ntfslib_record_refresh_test tests/record_refresh.cpp)
     target_include_directories(ntfslib_record_refresh_test PRIVATE
         "${NTFSLIB_ROOT}/include/internal")
@@ -144,6 +149,23 @@ if(BUILD_TESTING)
         -Wall
         -Wextra
     )
+
+    add_executable(ntfslib_posix_edge
+        tests/posix_edge.cpp
+    )
+    target_compile_features(ntfslib_posix_edge PRIVATE cxx_std_17)
+    target_compile_options(ntfslib_posix_edge PRIVATE
+        -Wall
+        -Wextra
+        -Wno-unused-result
+    )
+    find_package(Threads REQUIRED)
+    target_link_libraries(ntfslib_posix_edge PRIVATE Threads::Threads)
+
+    add_executable(ntfslib_data_stream tests/data_stream.cpp)
+    target_compile_features(ntfslib_data_stream PRIVATE cxx_std_17)
+    target_compile_options(ntfslib_data_stream PRIVATE -Wall -Wextra)
+    target_link_libraries(ntfslib_data_stream PRIVATE Threads::Threads)
 
     add_executable(ntfslib_resident_update_test
         tests/resident_update.cpp
@@ -182,6 +204,14 @@ endif()
 
 if(BUILD_TESTING AND NTFSLIB_BUILD_FUSE)
     find_program(MKNTFS_EXECUTABLE NAMES mkntfs mkfs.ntfs)
+    if(MKNTFS_EXECUTABLE)
+        add_executable(ntfslib_resident_promotion_test tests/resident_promotion.cpp)
+        target_link_libraries(ntfslib_resident_promotion_test PRIVATE ntfslib_linux)
+        target_link_options(ntfslib_resident_promotion_test PRIVATE -Wl,--wrap=NtfsWriteVolumeContext)
+        add_test(NAME ntfslib_linux_resident_promotion COMMAND /bin/sh
+            "${CMAKE_CURRENT_LIST_DIR}/tests/resident_promotion.sh" "$<TARGET_FILE:ntfslib_fuse>"
+            "$<TARGET_FILE:ntfslib_resident_promotion_test>" "${MKNTFS_EXECUTABLE}")
+    endif()
     find_program(NTFSCP_EXECUTABLE NAMES ntfscp)
     find_program(NTFSTRUNCATE_EXECUTABLE NAMES ntfstruncate)
     find_program(NTFSLS_EXECUTABLE NAMES ntfsls)
@@ -194,6 +224,21 @@ if(BUILD_TESTING AND NTFSLIB_BUILD_FUSE)
     find_program(FUSERMOUNT3_EXECUTABLE NAMES fusermount3)
     find_program(NTFSSECAUDIT_EXECUTABLE NAMES ntfssecaudit)
     find_program(FAKEROOT_EXECUTABLE NAMES fakeroot)
+    if(MKNTFS_EXECUTABLE)
+        add_executable(ntfslib_create_eas_test tests/create_eas.cpp)
+        target_compile_features(ntfslib_create_eas_test PRIVATE cxx_std_17)
+        target_link_libraries(ntfslib_create_eas_test PRIVATE ntfslib_linux)
+        target_link_options(ntfslib_create_eas_test PRIVATE -Wl,--wrap=NtfsWriteVolumeContext)
+        add_test(NAME ntfslib_linux_create_eas COMMAND /bin/sh
+            "${CMAKE_CURRENT_LIST_DIR}/tests/fresh_volume_test.sh" "$<TARGET_FILE:ntfslib_fuse>"
+            "$<TARGET_FILE:ntfslib_create_eas_test>" "${MKNTFS_EXECUTABLE}")
+        add_executable(ntfslib_delete_child_test tests/delete_child.cpp)
+        target_compile_features(ntfslib_delete_child_test PRIVATE cxx_std_17)
+        target_link_libraries(ntfslib_delete_child_test PRIVATE ntfslib_linux)
+        add_test(NAME ntfslib_linux_delete_child COMMAND /bin/sh
+            "${CMAKE_CURRENT_LIST_DIR}/tests/fresh_volume_test.sh" "$<TARGET_FILE:ntfslib_fuse>"
+            "$<TARGET_FILE:ntfslib_delete_child_test>" "${MKNTFS_EXECUTABLE}")
+    endif()
     find_program(XXD_EXECUTABLE NAMES xxd)
     find_library(WIM_LIBRARY NAMES wim libwim.so.15)
     set(_ntfslib_format_4k_reference "")
@@ -349,6 +394,17 @@ if(BUILD_TESTING AND NTFSLIB_BUILD_FUSE)
                 "${NTFSFIX_EXECUTABLE}"
         )
     endif()
+    if(MKNTFS_EXECUTABLE AND NTFSCAT_EXECUTABLE AND NTFSFIX_EXECUTABLE)
+        add_test(
+            NAME ntfslib_linux_large_cluster
+            COMMAND /bin/sh
+                "${CMAKE_CURRENT_LIST_DIR}/tests/large_cluster_smoke.sh"
+                "$<TARGET_FILE:ntfslib_fuse>"
+                "${MKNTFS_EXECUTABLE}"
+                "${NTFSCAT_EXECUTABLE}"
+                "${NTFSFIX_EXECUTABLE}"
+        )
+    endif()
     if(MKNTFS_EXECUTABLE AND
        NTFSLS_EXECUTABLE AND
        NTFSCAT_EXECUTABLE AND
@@ -447,6 +503,56 @@ if(BUILD_TESTING AND NTFSLIB_BUILD_FUSE)
         set_tests_properties(
             ntfslib_linux_mount_write
             PROPERTIES SKIP_RETURN_CODE 77
+        )
+        add_test(
+            NAME ntfslib_linux_posix_edge
+            COMMAND /bin/sh
+                "${CMAKE_CURRENT_LIST_DIR}/tests/posix_edge_smoke.sh"
+                "$<TARGET_FILE:ntfslib_fuse>"
+                "$<TARGET_FILE:ntfslib_posix_edge>"
+                "${MKNTFS_EXECUTABLE}"
+                "${NTFS3G_EXECUTABLE}"
+                "${FUSERMOUNT3_EXECUTABLE}"
+                "${NTFSFIX_EXECUTABLE}"
+        )
+        set_tests_properties(
+            ntfslib_linux_posix_edge
+            PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900
+        )
+        add_test(
+            NAME ntfslib_linux_data_stream
+            COMMAND /bin/sh
+                "${CMAKE_CURRENT_LIST_DIR}/tests/data_stream_smoke.sh"
+                "$<TARGET_FILE:ntfslib_fuse>"
+                "$<TARGET_FILE:ntfslib_data_stream>"
+                "${MKNTFS_EXECUTABLE}"
+                "${NTFS3G_EXECUTABLE}"
+                "${FUSERMOUNT3_EXECUTABLE}"
+                "${NTFSFIX_EXECUTABLE}"
+        )
+        set_tests_properties(
+            ntfslib_linux_data_stream
+            PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900
+        )
+        find_program(SFDISK_EXECUTABLE NAMES sfdisk)
+        set(_ntfslib_sfdisk "")
+        if(SFDISK_EXECUTABLE)
+            set(_ntfslib_sfdisk "${SFDISK_EXECUTABLE}")
+        endif()
+        add_test(
+            NAME ntfslib_linux_resize
+            COMMAND /bin/sh
+                "${CMAKE_CURRENT_LIST_DIR}/tests/resize_smoke.sh"
+                "$<TARGET_FILE:ntfslib_fuse>"
+                "${MKNTFS_EXECUTABLE}"
+                "${NTFS3G_EXECUTABLE}"
+                "${FUSERMOUNT3_EXECUTABLE}"
+                "${NTFSFIX_EXECUTABLE}"
+                ${_ntfslib_sfdisk}
+        )
+        set_tests_properties(
+            ntfslib_linux_resize
+            PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900
         )
     endif()
     if(MKNTFS_EXECUTABLE AND

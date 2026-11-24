@@ -14,6 +14,8 @@
 #include "arm64/raise.h"
 #elif defined(_M_RISCV64)
 #include "riscv64/raise.h"
+#elif defined(_M_ARM)
+#include "arm/raise.h"
 #elif defined(_M_PPC)
 #include "ppc/raise.h"
 #endif
@@ -210,6 +212,10 @@ RtlLeaveHeapLock(IN OUT PHEAP_LOCK Lock);
 BOOLEAN
 NTAPI
 RtlpCheckForActiveDebugger(VOID);
+
+BOOLEAN
+NTAPI
+RtlpKernelDebuggerEnabled(VOID);
 
 typedef BOOLEAN (NTAPI *PRTLP_DISPATCH_EXCEPTION_HOOK)(PEXCEPTION_RECORD ExceptionRecord,
                                                         PCONTEXT ContextRecord,

@@ -1,7 +1,7 @@
 
 include_directories(
     include
-    ${REACTOS_SOURCE_DIR}/sdk/include/reactos/drivers)
+    ${REACTOS_SOURCE_DIR}/sdk/include/libernt/drivers)
 
 #
 # subdirectories containing special-purpose drivers
@@ -82,6 +82,7 @@ list(APPEND KMTEST_DRV_SOURCE
     directx/DxgkHotPlugWork.c
     directx/DxgkChildDescriptor.c
     directx/DxgkPostDisplayHandoff.c
+    directx/DxgkStopScreen.c
     directx/DxgkPresentUserSource.c
     directx/MonitorBrightnessKey.c
     directx/DxgkGpuVaAddress.c
@@ -136,6 +137,7 @@ list(APPEND KMTEST_DRV_SOURCE
     ks/KsDispatchFileObject.c
     ndis/NdisIfProvider.c
     ndis/NdisRwLock.c
+    ndis/NdisWdiIhvResponse.c
     ndis/NdisWdiStationCaps.c
     ndis/NdisProcessorGroup.c
     ndis/NdisLegacyHelpers.c
@@ -151,6 +153,7 @@ list(APPEND KMTEST_DRV_SOURCE
     ntos_cm/CmBootFlush.c
     ntos_cm/CmCallbacks.c
     ntos_cm/CmKeyKM.c
+    ntos_cm/CmSaveKeyFlush.c
     ntos_cm/CmSecurity.c
     ntos_cm/CmTransactions.c
     ntos_etw/EtwRegisterKM.c
@@ -310,6 +313,7 @@ list(APPEND KMTEST_DRV_SOURCE
     ntos_ke/KeIpiKM.c
     ntos_ke/KeIrql.c
     ntos_ke/KeCacheInvalidation.c
+    ntos_ke/KeClockHeldOff.c
     ntos_ke/KeClockKeepAlive.c
     ntos_ke/KeClockWatchdog.c
     ntos_ke/KeCycleTime.c
@@ -321,6 +325,7 @@ list(APPEND KMTEST_DRV_SOURCE
     ntos_ke/KeQueryBasePriority.c
     ntos_ke/KeProcessor.c
     ntos_ke/KePriorityRaise.c
+    ntos_ke/KeQuantumBalance.c
     ntos_ke/KeQuantumEnd.c
     ntos_ke/KeSemaphore.c
     ntos_ke/KeSpinLock.c
@@ -328,6 +333,7 @@ list(APPEND KMTEST_DRV_SOURCE
     ntos_ke/KeTime.c
     ntos_ke/KeTimer.c
     ntos_ke/KeTimer2KM.c
+    ntos_ke/KeUnalignedAccess.c
     ntos_ke/KeWaitMultiple.c
     ntos_mm/MmAllocateContiguousNode.c
     ntos_mm/MmContiguousCacheTypes.c
@@ -678,6 +684,7 @@ list(APPEND KMTEST_SOURCE
     ntos_io/IoCreateFile_user.c
     ntos_io/IoDeviceObject_user.c
     ntos_io/IoHandleAccess_user.c
+    ntos_io/IoI8042StartInformation_user.c
     ntos_io/IoIs32bitProcess_user.c
     ntos_io/IoCustomTargetEvent_user.c
     ntos_io/IoDeviceTree_user.c
@@ -769,6 +776,7 @@ add_dependencies(kmtest_drivers
     iocreatefile_drv
     iodeviceobject_drv
     iohelper_drv
+    ioi8042startinformation_drv
     ioreadwrite_drv
     ioremovechild_drv
     ioremoveunload_drv

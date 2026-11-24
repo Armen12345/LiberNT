@@ -6,7 +6,7 @@
  */
 
 #include <ntoskrnl.h>
-#include <reactos/arm64/earlyfont.h>
+#include <libernt/arm64/earlyfont.h>
 
 #define KI_EARLY_SCREEN_CELL_HEIGHT   14
 #define KI_EARLY_SCREEN_CACHE_LINE    64
@@ -109,9 +109,19 @@ static
 VOID
 KiEarlyScreenNewLine(VOID)
 {
+    ULONG Row;
+
     KiEarlyScreenColumn = 0;
-    KiEarlyScreenRow = (KiEarlyScreenRow + 1) % KiEarlyScreenRows;
-    KiEarlyScreenClearRow(KiEarlyScreenRow);
+    if (KiEarlyScreenRow + 1 < KiEarlyScreenRows)
+    {
+        KiEarlyScreenRow++;
+        return;
+    }
+
+    /* Reading the frame buffer back to scroll is too slow this early, so a full screen starts a new page */
+    for (Row = 0; Row < KiEarlyScreenRows; Row++)
+        KiEarlyScreenClearRow(Row);
+    KiEarlyScreenRow = 0;
 }
 
 VOID
@@ -168,6 +178,12 @@ KiEarlyScreenPrint(
     RtlStringCbVPrintfA(Text, sizeof(Text), Format, Arguments);
     va_end(Arguments);
     KiArm64EarlyScreenWrite(Text, sizeof(Text));
+}
+
+BOOLEAN
+KiArm64EarlyScreenReady(VOID)
+{
+    return KiEarlyScreenBase != NULL;
 }
 
 VOID

@@ -9,7 +9,7 @@
 #include "softgpu.h"
 #include "softgpu_2d_core.h"
 #include "appledcp.h"
-#include <reactos/drivers/appleagx.h>
+#include <libernt/drivers/appleagx.h>
 
 static PDRIVER_DISPATCH DcpDxgkPnp;
 static DCP_INTERRUPT_RESOURCES DcpInterrupt;
@@ -440,6 +440,7 @@ SoftGpuPlatformQueryStart(
     Config->ScanoutPhysicalAddress = Context->SurfacePhysical;
     Config->ScanoutPitch = Context->Pitch;
     Config->ScanoutSize = Context->SurfaceSize;
+    Config->SystemDisplayDirect = TRUE;
 
     Status = SoftGpu2dComputeAllocationSlabSize(Config->Width,
                                                 Config->Height,

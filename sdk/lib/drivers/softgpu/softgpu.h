@@ -39,17 +39,6 @@
 
 #pragma once
 
-/* ---- Minimum OS version (must precede the kernel headers) --------------- *
- * Mirror dxgkrnl_private.h.  The ReactOS build targets XP (0x502) globally;
- * the WDDM2 structures in dispmprt.h are gated on NTDDI_WIN7, so raise the
- * version both here and on the command line (see CMakeLists.txt). */
-#undef  _WIN32_WINNT
-#define _WIN32_WINNT  0x0603    /* Windows 8.1 */
-#undef  WINVER
-#define WINVER        0x0603
-#undef  NTDDI_VERSION
-#define NTDDI_VERSION 0x06030000 /* NTDDI_WINBLUE */
-
 /* ---- WDDM DDI interface version: WDDM 2.0 (Win10) ----------------------- *
  * CMakeLists.txt passes -DDXGKDDI_INTERFACE_VERSION=0x5023; default it here
  * defensively so the WDDM2 DRIVER_INITIALIZATION_DATA / DXGKARG_* fields are
@@ -82,7 +71,7 @@
  * argument struct, the WDDM2 DDI typedefs and the DxgkInitialize prototype.
  * It is the same header dxgkrnl is built against, guaranteeing matching ABI. */
 #include <dispmprt.h>
-#include <reactos/rddm/rxgkpresent.h>
+#include <libernt/rddm/rxgkpresent.h>
 
 /* ---- Debug helpers ------------------------------------------------------- */
 #define NDEBUG
@@ -329,6 +318,7 @@ typedef struct _SOFTGPU_DEVICE
     PVOID               PlatformContext;
     PVOID               PlatformServicesContext;
     BOOLEAN             PlatformDirectScanout;
+    BOOLEAN             PlatformSystemDisplay;
     BOOLEAN             PlatformHardwarePointer;
     /* The platform turns its pointer plane on and off at run time with
      * SoftGpuPointerSetPlatformHardware; the pointer is emulated while off. */
@@ -425,6 +415,7 @@ typedef struct _SOFTGPU_PLATFORM_CONFIG
     ULONG               ScanoutPitch;
     ULONGLONG           ScanoutSize;
     PVOID               ScanoutShadow;
+    BOOLEAN             SystemDisplayDirect;
     PHYSICAL_ADDRESS    HighestFrameBufferAddress;
     SIZE_T              MinimumAllocationSlabSize;
     ULONG               ModeCount;
@@ -1099,6 +1090,27 @@ APIENTRY
 SoftGpuDdiGetScanLine(
     _In_    PVOID                 MiniportDeviceContext,
     _Inout_ PDXGKARG_GETSCANLINE  GetScanLine);
+
+NTSTATUS
+APIENTRY
+SoftGpuDdiSystemDisplayEnable(
+    _In_  PVOID                                MiniportDeviceContext,
+    _In_  D3DDDI_VIDEO_PRESENT_TARGET_ID       TargetId,
+    _In_  PDXGKARG_SYSTEM_DISPLAY_ENABLE_FLAGS Flags,
+    _Out_ PUINT                                Width,
+    _Out_ PUINT                                Height,
+    _Out_ D3DDDIFORMAT                         *ColorFormat);
+
+VOID
+APIENTRY
+SoftGpuDdiSystemDisplayWrite(
+    _In_ PVOID MiniportDeviceContext,
+    _In_ PVOID Source,
+    _In_ UINT  SourceWidth,
+    _In_ UINT  SourceHeight,
+    _In_ UINT  SourceStride,
+    _In_ UINT  PositionX,
+    _In_ UINT  PositionY);
 
 NTSTATUS
 APIENTRY
